@@ -77,11 +77,6 @@ document.addEventListener('DOMContentLoaded', function() {
                 <span>${serverUrl}</span>
                 </div>
 
-                #<div style="display: flex; justify-content: space-between;">
-                #<strong>Account:</strong>
-                #<span>${username}</span>
-                #</div>
-
                 <br>
                 <hr>
                 <br>
