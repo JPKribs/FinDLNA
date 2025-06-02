@@ -416,12 +416,14 @@ public class ContentDirectoryService
         return itemType switch
         {
             BaseItemDto_Type.Movie => "object.item.videoItem.movie",
+            BaseItemDto_Type.AudioBook => "object.item.audioItem.musicTrack",
             BaseItemDto_Type.Episode => "object.item.videoItem",
             BaseItemDto_Type.Series => "object.container.album.videoAlbum",
             BaseItemDto_Type.Season => "object.container.album.videoAlbum",
             BaseItemDto_Type.Audio => "object.item.audioItem.musicTrack",
             BaseItemDto_Type.MusicAlbum => "object.container.album.musicAlbum",
             BaseItemDto_Type.MusicArtist => "object.container.person.musicArtist",
+            BaseItemDto_Type.MusicVideo => "object.item.videoItem",
             BaseItemDto_Type.Photo => "object.item.imageItem.photo",
             BaseItemDto_Type.Video => "object.item.videoItem",
             BaseItemDto_Type.CollectionFolder => "object.container.storageFolder",
