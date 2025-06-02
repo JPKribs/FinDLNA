@@ -71,8 +71,25 @@ document.addEventListener('DOMContentLoaded', function() {
             <h1>FinDLNA Server</h1>
             <div class="info-box">
                 <h3>Current Configuration</h3>
-                <p><strong>Server:</strong> ${serverUrl}</p>
-                <p><strong>Status:</strong> DLNA Server Running</p>
+
+                <div style="display: flex; justify-content: space-between;">
+                <strong>Server:</strong>
+                <span>${serverUrl}</span>
+                </div>
+
+                #<div style="display: flex; justify-content: space-between;">
+                #<strong>Account:</strong>
+                #<span>${username}</span>
+                #</div>
+
+                <br>
+                <hr>
+                <br>
+
+                <div style="display: flex; justify-content: space-between;">
+                <strong>Status:</strong>
+                <span>Running</span>
+                </div>
             </div>
             <button id="reconfigureBtn" class="reconfigure-btn">Reconfigure</button>
         `;
@@ -92,7 +109,7 @@ document.addEventListener('DOMContentLoaded', function() {
             <form id="loginForm">
                 <input type="url" id="serverUrl" placeholder="Jellyfin Server URL" required>
                 <input type="text" id="username" placeholder="Username" required>
-                <input type="password" id="password" placeholder="Password (optional)">
+                <input type="password" id="password" placeholder="Password">
                 <button type="submit">Connect</button>
             </form>
             <div id="status"></div>
