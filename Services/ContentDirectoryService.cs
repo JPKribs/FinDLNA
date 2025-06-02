@@ -24,7 +24,9 @@ public class ContentDirectoryService
 
     private static readonly HashSet<BaseItemDto_Type> ContainerTypes = new()
     {
+        BaseItemDto_Type.AggregateFolder,
         BaseItemDto_Type.CollectionFolder,
+        BaseItemDto_Type.BoxSet,
         BaseItemDto_Type.Folder,
         BaseItemDto_Type.UserView,
         BaseItemDto_Type.Series,
@@ -41,6 +43,7 @@ public class ContentDirectoryService
         BaseItemDto_Type.Audio,
         BaseItemDto_Type.Photo,
         BaseItemDto_Type.Video,
+        BaseItemDto_Type.MusicVideo,
         BaseItemDto_Type.AudioBook
     };
 
@@ -289,7 +292,7 @@ public class ContentDirectoryService
 
         var sortedResults = allResults
             .OrderBy(x => !x.isContainer)
-            .ThenBy(x => x.item.Type == BaseItemDto_Type.Episode 
+            .ThenBy(x => (x.item.Type == BaseItemDto_Type.Episode || x.item.Type == BaseItemDto_Type.Season)
                 ? x.item.IndexNumber ?? int.MaxValue 
                 : int.MaxValue)
             .ThenBy(x => x.title)
