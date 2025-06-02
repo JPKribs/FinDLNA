@@ -72,13 +72,13 @@ document.addEventListener('DOMContentLoaded', function() {
             <div class="info-box">
                 <h3>Current Configuration</h3>
 
+                <br>
+
                 <div style="display: flex; justify-content: space-between;">
                 <strong>Server:</strong>
                 <span>${serverUrl}</span>
                 </div>
 
-                <br>
-                <hr>
                 <br>
 
                 <div style="display: flex; justify-content: space-between;">
