@@ -162,8 +162,6 @@ public class ContentDirectoryService
     {
         try
         {
-            _logger.LogInformation("Raw SOAP body received: {SoapBody}", soapBody);
-            
             var doc = XDocument.Parse(soapBody);
             var ns = XNamespace.Get("http://schemas.xmlsoap.org/soap/envelope/");
             var upnpNs = XNamespace.Get("urn:schemas-upnp-org:service:ContentDirectory:1");
@@ -175,13 +173,12 @@ public class ContentDirectoryService
                 return CreateSoapFault("Invalid SOAP request");
             }
 
-            var objectId = browseElement.Element(upnpNs + "ObjectID")?.Value ?? "0";
-            var browseFlag = browseElement.Element(upnpNs + "BrowseFlag")?.Value ?? "BrowseDirectChildren";
-            var startIndex = int.Parse(browseElement.Element(upnpNs + "StartingIndex")?.Value ?? "0");
-            var requestedCount = int.Parse(browseElement.Element(upnpNs + "RequestedCount")?.Value ?? "0");
+            var objectId = browseElement.Element("ObjectID")?.Value ?? "0";
+            var browseFlag = browseElement.Element("BrowseFlag")?.Value ?? "BrowseDirectChildren";
+            var startIndex = int.Parse(browseElement.Element("StartingIndex")?.Value ?? "0");
+            var requestedCount = int.Parse(browseElement.Element("RequestedCount")?.Value ?? "0");
 
-            _logger.LogInformation("Parsed ObjectID: '{ObjectId}', BrowseFlag: '{BrowseFlag}'", objectId, browseFlag);
-            _logger.LogInformation("DLNA Browse Request - ObjectID: {ObjectId}, BrowseFlag: {BrowseFlag}", objectId, browseFlag);
+            _logger.LogDebug("Browse request - ObjectID: {ObjectId}, BrowseFlag: {BrowseFlag}", objectId, browseFlag);
 
             var result = await BrowseAsync(objectId, browseFlag, startIndex, requestedCount);
             return CreateBrowseResponse(result.didl, result.numberReturned, result.totalMatches);
@@ -234,40 +231,27 @@ public class ContentDirectoryService
         var didlBuilder = new StringBuilder();
         var items = new List<BaseItemDto>();
 
-        _logger.LogInformation("Browsing objectId: '{ObjectId}' (length: {Length})", objectId, objectId?.Length ?? 0);
-
         if (objectId == "0")
         {
-            _logger.LogInformation("Fetching root library folders");
             var libraries = await _jellyfinService.GetLibraryFoldersAsync();
             if (libraries != null)
             {
                 items.AddRange(libraries);
-                _logger.LogInformation("Found {Count} library folders", libraries.Count);
+                _logger.LogDebug("Found {Count} library folders", libraries.Count);
             }
         }
         else if (Guid.TryParse(objectId, out var parentId))
         {
-            _logger.LogInformation("Successfully parsed GUID. Fetching children for parentId: {ParentId}", parentId);
-            
             var parentItem = await _jellyfinService.GetItemAsync(parentId);
             if (parentItem != null)
             {
-                _logger.LogInformation("Parent item: {Name} (Type: {Type}, CollectionType: {CollectionType})", 
-                    parentItem.Name, parentItem.Type, parentItem.CollectionType);
-
                 if (parentItem.Type == BaseItemDto_Type.CollectionFolder)
                 {
-                    _logger.LogInformation("Browsing collection folder content for {CollectionType}", parentItem.CollectionType);
                     var childItems = await _jellyfinService.GetLibraryContentAsync(parentId);
                     if (childItems != null)
                     {
                         items.AddRange(childItems);
-                        _logger.LogInformation("Found {Count} items in collection folder", childItems.Count);
-                    }
-                    else
-                    {
-                        _logger.LogWarning("GetLibraryContentAsync returned null for {ParentId}", parentId);
+                        _logger.LogDebug("Found {Count} items in collection folder", childItems.Count);
                     }
                 }
                 else
@@ -277,11 +261,7 @@ public class ContentDirectoryService
                     {
                         var filteredItems = childItems.Where(item => item.Id != parentId).ToList();
                         items.AddRange(filteredItems);
-                        _logger.LogInformation("Found {Count} child items for {ParentId}", filteredItems.Count, parentId);
-                    }
-                    else
-                    {
-                        _logger.LogWarning("GetItemsAsync returned null for {ParentId}", parentId);
+                        _logger.LogDebug("Found {Count} child items for {ParentId}", filteredItems.Count, parentId);
                     }
                 }
             }
@@ -298,9 +278,6 @@ public class ContentDirectoryService
         var totalMatches = items.Count;
         var endIndex = requestedCount > 0 ? Math.Min(startIndex + requestedCount, totalMatches) : totalMatches;
         var itemsToReturn = items.Skip(startIndex).Take(endIndex - startIndex).ToList();
-
-        _logger.LogInformation("Returning {Count} items (from {StartIndex} to {EndIndex} of {TotalMatches})", 
-            itemsToReturn.Count, startIndex, endIndex, totalMatches);
 
         foreach (var item in itemsToReturn)
         {
@@ -396,8 +373,22 @@ public class ContentDirectoryService
     // MARK: GetLocalStreamUrl
     private string GetLocalStreamUrl(Guid itemId)
     {
-        // Return a URL pointing to our local streaming endpoint
-        return $"http://localhost:8200/stream/{itemId}";
+        var localIp = GetLocalIPAddress();
+        return $"http://{localIp}:8200/stream/{itemId}";
+    }
+
+    // MARK: GetLocalIPAddress
+    private string GetLocalIPAddress()
+    {
+        var host = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName());
+        foreach (var ip in host.AddressList)
+        {
+            if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !System.Net.IPAddress.IsLoopback(ip))
+            {
+                return ip.ToString();
+            }
+        }
+        return "127.0.0.1";
     }
 
     // MARK: GetItemSize
@@ -453,9 +444,6 @@ public class ContentDirectoryService
     private string CreateBrowseResponse(string didl, int numberReturned, int totalMatches)
     {
         var escapedDidl = System.Security.SecurityElement.Escape(didl);
-        
-        // MARK: Debug - log the actual DIDL-Lite XML being returned
-        _logger.LogInformation("DIDL-Lite XML being returned: {DidlXml}", didl);
         
         return $"""
             <?xml version="1.0"?>

@@ -44,7 +44,6 @@ public class JellyfinService
         try
         {
             var userId = Guid.Parse(_configuration["Jellyfin:UserId"] ?? "");
-            _logger.LogInformation("Fetching library folders for user {UserId}", userId);
             
             var response = await _apiClient.Items.GetAsync(requestConfiguration =>
             {
@@ -62,16 +61,7 @@ public class JellyfinService
                 requestConfiguration.QueryParameters.SortOrder = [SortOrder.Ascending];
             });
             
-            _logger.LogInformation("Retrieved {Count} library folders", response?.Items?.Count ?? 0);
-            
-            if (response?.Items != null)
-            {
-                foreach (var item in response.Items)
-                {
-                    _logger.LogInformation("Library: {Name} (Type: {Type}, Id: {Id}, CollectionType: {CollectionType}, ChildCount: {ChildCount})", 
-                        item.Name, item.Type, item.Id, item.CollectionType, item.ChildCount);
-                }
-            }
+            _logger.LogDebug("Retrieved {Count} library folders", response?.Items?.Count ?? 0);
             
             return response?.Items;
         }
@@ -90,7 +80,6 @@ public class JellyfinService
         try
         {
             var userId = Guid.Parse(_configuration["Jellyfin:UserId"] ?? "");
-            _logger.LogInformation("Fetching library content for library {LibraryId}, user {UserId}", libraryId, userId);
             
             var response = await _apiClient.Items.GetAsync(requestConfiguration =>
             {
@@ -107,7 +96,6 @@ public class JellyfinService
                 requestConfiguration.QueryParameters.SortBy = [ItemSortBy.SortName];
                 requestConfiguration.QueryParameters.SortOrder = [SortOrder.Ascending];
                 
-                // Exclude certain item types that aren't useful for DLNA browsing
                 requestConfiguration.QueryParameters.ExcludeItemTypes = [
                     BaseItemKind.Person,
                     BaseItemKind.Genre,
@@ -115,21 +103,7 @@ public class JellyfinService
                 ];
             });
             
-            _logger.LogInformation("Retrieved {Count} items from library {LibraryId}", response?.Items?.Count ?? 0, libraryId);
-            
-            if (response?.Items != null && response.Items.Count > 0)
-            {
-                foreach (var item in response.Items.Take(5))
-                {
-                    _logger.LogInformation("Library item: {Name} (Type: {Type}, IsFolder: {IsFolder}, Id: {Id})", 
-                        item.Name, item.Type, item.IsFolder, item.Id);
-                }
-                
-                if (response.Items.Count > 5)
-                {
-                    _logger.LogInformation("... and {Count} more items", response.Items.Count - 5);
-                }
-            }
+            _logger.LogDebug("Retrieved {Count} items from library {LibraryId}", response?.Items?.Count ?? 0, libraryId);
             
             return response?.Items;
         }
@@ -148,7 +122,6 @@ public class JellyfinService
         try
         {
             var userId = Guid.Parse(_configuration["Jellyfin:UserId"] ?? "");
-            _logger.LogInformation("Fetching items for parent {ParentId}, user {UserId}", parentId, userId);
             
             var response = await _apiClient.Items.GetAsync(requestConfiguration =>
             {
@@ -179,16 +152,7 @@ public class JellyfinService
                 requestConfiguration.QueryParameters.SortOrder = [SortOrder.Ascending];
             });
             
-            _logger.LogInformation("Retrieved {Count} items for parent {ParentId}", response?.Items?.Count ?? 0, parentId);
-            
-            if (response?.Items != null)
-            {
-                foreach (var item in response.Items.Take(3))
-                {
-                    _logger.LogInformation("Item: {Name} (Type: {Type}, IsFolder: {IsFolder}, Id: {Id})", 
-                        item.Name, item.Type, item.IsFolder, item.Id);
-                }
-            }
+            _logger.LogDebug("Retrieved {Count} items for parent {ParentId}", response?.Items?.Count ?? 0, parentId);
             
             return response?.Items;
         }

@@ -462,15 +462,25 @@ public class DlnaService : IDisposable
 
         await _ssdpService.StopAsync();
 
-        _httpListener?.Stop();
-        _httpListener?.Close();
+        try
+        {
+            _httpListener?.Stop();
+            _httpListener?.Close();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Already disposed
+        }
 
         _logger.LogInformation("DLNA service stopped");
     }
 
     public void Dispose()
     {
-        StopAsync().Wait();
+        if (_isRunning)
+        {
+            _ = StopAsync();
+        }
         _ssdpService?.Dispose();
         _httpListener?.Close();
         GC.SuppressFinalize(this);
