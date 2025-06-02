@@ -1,12 +1,12 @@
 # WORK IN PROGRESS
 
-# FinDLNA - Jellyfin DLNA Proxy Server
+# Jellyfin DLNA Proxy
 
 A lightweight DLNA Media Server proxy that runs on Raspberry Pi and exposes remote Jellyfin server libraries as a local UPnP/DLNA MediaServer. This allows DLNA-compatible devices (smart TVs, game consoles, media players) to browse and stream content from your Jellyfin server without direct network access to it.
 
 ## Overview
 
-FinDLNA acts as a bridge between your Jellyfin media server and DLNA clients on your local network. The Raspberry Pi handles SSDP broadcasts, UPnP service discovery, and content directory browsing while proxying all media streams from the remote Jellyfin server.
+Jellyfin DLNA Proxy acts as a bridge between your Jellyfin media server and DLNA clients on your local network. The Raspberry Pi handles SSDP broadcasts, UPnP service discovery, and content directory browsing while proxying all media streams from the remote Jellyfin server.
 
 ## Key Features
 
