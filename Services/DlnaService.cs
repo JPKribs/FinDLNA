@@ -1,6 +1,5 @@
 using System.Net;
 using System.Text;
-using System.Text.RegularExpressions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using FinDLNA.Services;
@@ -79,8 +78,14 @@ public class DlnaService : IDisposable
                 var context = await _httpListener.GetContextAsync();
                 _ = Task.Run(() => HandleRequest(context));
             }
-            catch (HttpListenerException)
+            catch (HttpListenerException ex) when (ex.ErrorCode == 995)
             {
+                _logger.LogDebug("HTTP listener was stopped");
+                break;
+            }
+            catch (ObjectDisposedException)
+            {
+                _logger.LogDebug("HTTP listener was disposed");
                 break;
             }
             catch (Exception ex)
@@ -93,14 +98,15 @@ public class DlnaService : IDisposable
     // MARK: HandleRequest
     private async Task HandleRequest(HttpListenerContext context)
     {
+        var request = context.Request;
+        var response = context.Response;
+        var path = request.Url?.AbsolutePath ?? "";
+        var userAgent = request.UserAgent ?? "";
+
+        _logger.LogDebug("DLNA request: {Method} {Path} from {UserAgent}", request.HttpMethod, path, userAgent);
+
         try
         {
-            var request = context.Request;
-            var response = context.Response;
-            var path = request.Url?.AbsolutePath ?? "";
-
-            _logger.LogDebug("DLNA request: {Method} {Path}", request.HttpMethod, path);
-
             switch (path)
             {
                 case "/device.xml":
@@ -112,7 +118,7 @@ public class DlnaService : IDisposable
                     break;
 
                 case "/ContentDirectory/control":
-                    await HandleControlRequest(request, response);
+                    await HandleContentDirectoryControl(request, response);
                     break;
 
                 case "/ContentDirectory/event":
@@ -134,12 +140,13 @@ public class DlnaService : IDisposable
                 default:
                     if (path.StartsWith("/stream/"))
                     {
-                        var itemId = path.Substring(8); // Remove "/stream/"
+                        var itemId = path.Substring(8);
                         await _streamingService.HandleStreamRequest(context, itemId);
-                        return; // StreamingService handles response
+                        return;
                     }
                     else
                     {
+                        _logger.LogDebug("Unknown path requested: {Path}", path);
                         response.StatusCode = 404;
                         response.Close();
                     }
@@ -148,13 +155,16 @@ public class DlnaService : IDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error handling DLNA request");
+            _logger.LogError(ex, "Error handling DLNA request for {Path}", path);
             try
             {
-                context.Response.StatusCode = 500;
-                context.Response.Close();
+                response.StatusCode = 500;
+                response.Close();
             }
-            catch { }
+            catch (Exception closeEx)
+            {
+                _logger.LogDebug(closeEx, "Error closing response after exception");
+            }
         }
     }
 
@@ -162,40 +172,200 @@ public class DlnaService : IDisposable
     private async Task HandleDeviceDescription(HttpListenerResponse response)
     {
         var xml = _ssdpService.GetDeviceDescriptionXml();
-        var buffer = Encoding.UTF8.GetBytes(xml);
-
-        response.ContentType = "text/xml; charset=utf-8";
-        response.ContentLength64 = buffer.Length;
-        response.AddHeader("Cache-Control", "max-age=1800");
-        response.AddHeader("Server", "FinDLNA/1.0 UPnP/1.0 FinDLNA/1.0");
-
-        await response.OutputStream.WriteAsync(buffer);
-        response.Close();
+        await WriteXmlResponse(response, xml, "max-age=1800");
     }
 
     // MARK: HandleServiceDescription
     private async Task HandleServiceDescription(HttpListenerResponse response)
     {
         var xml = _contentDirectoryService.GetServiceDescriptionXml();
-        var buffer = Encoding.UTF8.GetBytes(xml);
+        await WriteXmlResponse(response, xml, "max-age=1800");
+    }
 
-        response.ContentType = "text/xml; charset=utf-8";
-        response.ContentLength64 = buffer.Length;
-        response.AddHeader("Cache-Control", "max-age=1800");
+    // MARK: HandleContentDirectoryControl
+    private async Task HandleContentDirectoryControl(HttpListenerRequest request, HttpListenerResponse response)
+    {
+        if (request.HttpMethod != "POST")
+        {
+            response.StatusCode = 405;
+            response.AddHeader("Allow", "POST");
+            response.Close();
+            return;
+        }
 
-        await response.OutputStream.WriteAsync(buffer);
-        response.Close();
+        var soapAction = request.Headers["SOAPAction"]?.Trim('"');
+        if (string.IsNullOrEmpty(soapAction))
+        {
+            _logger.LogWarning("Missing SOAPAction header");
+            response.StatusCode = 400;
+            response.Close();
+            return;
+        }
+
+        try
+        {
+            using var reader = new StreamReader(request.InputStream, Encoding.UTF8);
+            var soapBody = await reader.ReadToEndAsync();
+
+            _logger.LogDebug("SOAP Action: {Action}", soapAction);
+
+            string responseXml;
+            if (soapAction.Contains("Browse"))
+            {
+                responseXml = await _contentDirectoryService.ProcessBrowseRequestAsync(soapBody, request.UserAgent);
+            }
+            else if (soapAction.Contains("GetSearchCapabilities"))
+            {
+                responseXml = _contentDirectoryService.ProcessSearchCapabilitiesRequest();
+            }
+            else if (soapAction.Contains("GetSortCapabilities"))
+            {
+                responseXml = _contentDirectoryService.ProcessSortCapabilitiesRequest();
+            }
+            else
+            {
+                _logger.LogWarning("Unsupported SOAP action: {Action}", soapAction);
+                responseXml = CreateUnsupportedActionResponse();
+            }
+
+            await WriteSoapResponse(response, responseXml);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing ContentDirectory control request");
+            var faultResponse = CreateSoapFault("Internal server error");
+            await WriteSoapResponse(response, faultResponse);
+        }
+    }
+
+    // MARK: HandleConnectionManagerControl
+    private async Task HandleConnectionManagerControl(HttpListenerRequest request, HttpListenerResponse response)
+    {
+        if (request.HttpMethod != "POST")
+        {
+            response.StatusCode = 405;
+            response.AddHeader("Allow", "POST");
+            response.Close();
+            return;
+        }
+
+        var soapAction = request.Headers["SOAPAction"]?.Trim('"');
+        if (string.IsNullOrEmpty(soapAction))
+        {
+            response.StatusCode = 400;
+            response.Close();
+            return;
+        }
+
+        try
+        {
+            string responseXml;
+            if (soapAction.Contains("GetProtocolInfo"))
+            {
+                responseXml = CreateGetProtocolInfoResponse();
+            }
+            else if (soapAction.Contains("GetCurrentConnectionIDs"))
+            {
+                responseXml = CreateGetCurrentConnectionIDsResponse();
+            }
+            else
+            {
+                _logger.LogWarning("Unsupported ConnectionManager action: {Action}", soapAction);
+                responseXml = CreateUnsupportedActionResponse();
+            }
+
+            await WriteSoapResponse(response, responseXml);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing ConnectionManager control request");
+            var faultResponse = CreateSoapFault("Internal server error");
+            await WriteSoapResponse(response, faultResponse);
+        }
     }
 
     // MARK: HandleConnectionManagerDescription
     private async Task HandleConnectionManagerDescription(HttpListenerResponse response)
     {
         var xml = GetConnectionManagerDescriptionXml();
-        var buffer = Encoding.UTF8.GetBytes(xml);
+        await WriteXmlResponse(response, xml, "max-age=1800");
+    }
 
+    // MARK: HandleEventSubscription
+    private Task HandleEventSubscription(HttpListenerRequest request, HttpListenerResponse response)
+    {
+        try
+        {
+            if (request.HttpMethod == "SUBSCRIBE")
+            {
+                var callback = request.Headers["CALLBACK"];
+                var timeout = request.Headers["TIMEOUT"] ?? "Second-1800";
+                
+                if (!string.IsNullOrEmpty(callback))
+                {
+                    var sid = $"uuid:{Guid.NewGuid()}";
+                    response.AddHeader("SID", sid);
+                    response.AddHeader("TIMEOUT", timeout);
+                    response.StatusCode = 200;
+                    _logger.LogDebug("Created subscription {SID} for {Callback}", sid, callback);
+                }
+                else
+                {
+                    response.StatusCode = 412;
+                    _logger.LogWarning("SUBSCRIBE request missing CALLBACK header");
+                }
+            }
+            else if (request.HttpMethod == "UNSUBSCRIBE")
+            {
+                var sid = request.Headers["SID"];
+                response.StatusCode = 200;
+                _logger.LogDebug("Unsubscribed {SID}", sid);
+            }
+            else
+            {
+                response.StatusCode = 405;
+                response.AddHeader("Allow", "SUBSCRIBE, UNSUBSCRIBE");
+            }
+
+            response.Close();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error handling event subscription");
+            response.StatusCode = 500;
+            response.Close();
+        }
+
+        return Task.CompletedTask;
+    }
+
+    // MARK: WriteXmlResponse
+    private async Task WriteXmlResponse(HttpListenerResponse response, string xml, string? cacheControl = null)
+    {
+        var buffer = Encoding.UTF8.GetBytes(xml);
+        
         response.ContentType = "text/xml; charset=utf-8";
         response.ContentLength64 = buffer.Length;
-        response.AddHeader("Cache-Control", "max-age=1800");
+        response.AddHeader("Server", "FinDLNA/1.0 UPnP/1.0 FinDLNA/1.0");
+        
+        if (!string.IsNullOrEmpty(cacheControl))
+        {
+            response.AddHeader("Cache-Control", cacheControl);
+        }
+
+        await response.OutputStream.WriteAsync(buffer);
+        response.Close();
+    }
+
+    // MARK: WriteSoapResponse
+    private async Task WriteSoapResponse(HttpListenerResponse response, string xml)
+    {
+        var buffer = Encoding.UTF8.GetBytes(xml);
+        
+        response.ContentType = "text/xml; charset=utf-8";
+        response.ContentLength64 = buffer.Length;
+        response.AddHeader("EXT", "");
+        response.AddHeader("Server", "FinDLNA/1.0 UPnP/1.0 FinDLNA/1.0");
 
         await response.OutputStream.WriteAsync(buffer);
         response.Close();
@@ -284,111 +454,31 @@ public class DlnaService : IDisposable
         """;
     }
 
-    // MARK: HandleControlRequest
-    private async Task HandleControlRequest(HttpListenerRequest request, HttpListenerResponse response)
-    {
-        if (request.HttpMethod != "POST")
-        {
-            response.StatusCode = 405;
-            response.Close();
-            return;
-        }
-
-        var soapAction = request.Headers["SOAPAction"]?.Trim('"');
-        if (string.IsNullOrEmpty(soapAction))
-        {
-            response.StatusCode = 400;
-            response.Close();
-            return;
-        }
-
-        using var reader = new StreamReader(request.InputStream);
-        var soapBody = await reader.ReadToEndAsync();
-
-        _logger.LogDebug("SOAP Action: {Action}", soapAction);
-
-        string responseXml;
-        if (soapAction.Contains("Browse"))
-        {
-            responseXml = await _contentDirectoryService.ProcessBrowseRequestAsync(soapBody);
-        }
-        else if (soapAction.Contains("GetSearchCapabilities"))
-        {
-            responseXml = _contentDirectoryService.ProcessSearchCapabilitiesRequest();
-        }
-        else if (soapAction.Contains("GetSortCapabilities"))
-        {
-            responseXml = _contentDirectoryService.ProcessSortCapabilitiesRequest();
-        }
-        else
-        {
-            responseXml = CreateUnsupportedActionResponse();
-        }
-
-        var buffer = Encoding.UTF8.GetBytes(responseXml);
-        response.ContentType = "text/xml; charset=utf-8";
-        response.ContentLength64 = buffer.Length;
-        response.AddHeader("EXT", "");
-        response.AddHeader("Server", "FinDLNA/1.0 UPnP/1.0 FinDLNA/1.0");
-
-        await response.OutputStream.WriteAsync(buffer);
-        response.Close();
-    }
-
-    // MARK: HandleConnectionManagerControl
-    private async Task HandleConnectionManagerControl(HttpListenerRequest request, HttpListenerResponse response)
-    {
-        if (request.HttpMethod != "POST")
-        {
-            response.StatusCode = 405;
-            response.Close();
-            return;
-        }
-
-        var soapAction = request.Headers["SOAPAction"]?.Trim('"');
-        if (string.IsNullOrEmpty(soapAction))
-        {
-            response.StatusCode = 400;
-            response.Close();
-            return;
-        }
-
-        string responseXml;
-        if (soapAction.Contains("GetProtocolInfo"))
-        {
-            responseXml = CreateGetProtocolInfoResponse();
-        }
-        else if (soapAction.Contains("GetCurrentConnectionIDs"))
-        {
-            responseXml = CreateGetCurrentConnectionIDsResponse();
-        }
-        else
-        {
-            responseXml = CreateUnsupportedActionResponse();
-        }
-
-        var buffer = Encoding.UTF8.GetBytes(responseXml);
-        response.ContentType = "text/xml; charset=utf-8";
-        response.ContentLength64 = buffer.Length;
-        response.AddHeader("EXT", "");
-
-        await response.OutputStream.WriteAsync(buffer);
-        response.Close();
-    }
-
     // MARK: CreateGetProtocolInfoResponse
     private string CreateGetProtocolInfoResponse()
     {
-        var source = "http-get:*:video/mp4:*,http-get:*:video/avi:*,http-get:*:audio/mpeg:*,http-get:*:audio/mp4:*,http-get:*:image/jpeg:*";
-        var sink = "";
+        var source = string.Join(",", new[]
+        {
+            "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_MP_SD_AAC_MULT5;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+            "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_MP_HD_720p_AAC;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+            "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_MP_HD_1080i_AAC;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+            "http-get:*:video/x-matroska:*",
+            "http-get:*:video/avi:*",
+            "http-get:*:audio/mpeg:DLNA.ORG_PN=MP3;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+            "http-get:*:audio/mp4:DLNA.ORG_PN=AAC_ISO_320;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+            "http-get:*:audio/flac:*",
+            "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_SM;DLNA.ORG_OP=00;DLNA.ORG_FLAGS=00D00000000000000000000000000000",
+            "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_MED;DLNA.ORG_OP=00;DLNA.ORG_FLAGS=00D00000000000000000000000000000",
+            "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_LRG;DLNA.ORG_OP=00;DLNA.ORG_FLAGS=00D00000000000000000000000000000"
+        });
 
         return $"""
             <?xml version="1.0"?>
             <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
                 <s:Body>
                     <u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">
-                        <Source>{source}</Source>
-                        <Sink>{sink}</Sink>
+                        <Source>{System.Security.SecurityElement.Escape(source)}</Source>
+                        <Sink></Sink>
                     </u:GetProtocolInfoResponse>
                 </s:Body>
             </s:Envelope>
@@ -408,29 +498,6 @@ public class DlnaService : IDisposable
                 </s:Body>
             </s:Envelope>
             """;
-    }
-
-    // MARK: HandleEventSubscription
-    private async Task HandleEventSubscription(HttpListenerRequest request, HttpListenerResponse response)
-    {
-        if (request.HttpMethod == "SUBSCRIBE")
-        {
-            var sid = $"uuid:{Guid.NewGuid()}";
-            response.AddHeader("SID", sid);
-            response.AddHeader("TIMEOUT", "Second-1800");
-            response.StatusCode = 200;
-        }
-        else if (request.HttpMethod == "UNSUBSCRIBE")
-        {
-            response.StatusCode = 200;
-        }
-        else
-        {
-            response.StatusCode = 405;
-        }
-
-        response.Close();
-        await Task.CompletedTask;
     }
 
     // MARK: CreateUnsupportedActionResponse
@@ -455,21 +522,45 @@ public class DlnaService : IDisposable
             """;
     }
 
+    // MARK: CreateSoapFault
+    private string CreateSoapFault(string error)
+    {
+        return $"""
+            <?xml version="1.0"?>
+            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+                <s:Body>
+                    <s:Fault>
+                        <faultcode>s:Server</faultcode>
+                        <faultstring>{System.Security.SecurityElement.Escape(error)}</faultstring>
+                    </s:Fault>
+                </s:Body>
+            </s:Envelope>
+            """;
+    }
+
     // MARK: StopAsync
     public async Task StopAsync()
     {
+        _logger.LogInformation("Stopping DLNA service");
         _isRunning = false;
 
-        await _ssdpService.StopAsync();
+        try
+        {
+            await _ssdpService.StopAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error stopping SSDP service");
+        }
 
         try
         {
             _httpListener?.Stop();
             _httpListener?.Close();
         }
-        catch (ObjectDisposedException)
+        catch (Exception ex)
         {
-            // Already disposed
+            _logger.LogWarning(ex, "Error stopping HTTP listener");
         }
 
         _logger.LogInformation("DLNA service stopped");
@@ -481,8 +572,17 @@ public class DlnaService : IDisposable
         {
             _ = StopAsync();
         }
-        _ssdpService?.Dispose();
-        _httpListener?.Close();
+        
+        try
+        {
+            _ssdpService?.Dispose();
+            _httpListener?.Close();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Error during disposal");
+        }
+        
         GC.SuppressFinalize(this);
     }
 }

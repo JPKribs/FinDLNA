@@ -13,175 +13,81 @@ public class ContentDirectoryService
 {
     private readonly ILogger<ContentDirectoryService> _logger;
     private readonly JellyfinService _jellyfinService;
+    private readonly DeviceProfileService _deviceProfileService;
+    private readonly XmlTemplateService _xmlTemplateService;
 
-    public ContentDirectoryService(ILogger<ContentDirectoryService> logger, JellyfinService jellyfinService)
+    private static readonly HashSet<string> ExcludedFolderNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Behind The Scenes", "Deleted Scenes", "Interviews", "Scenes", "Samples", "Shorts",
+        "Featurettes", "Extras", "Trailers", "Theme Videos", "Theme Songs", "Specials"
+    };
+
+    private static readonly HashSet<BaseItemDto_Type> ContainerTypes = new()
+    {
+        BaseItemDto_Type.CollectionFolder,
+        BaseItemDto_Type.Folder,
+        BaseItemDto_Type.UserView,
+        BaseItemDto_Type.Series,
+        BaseItemDto_Type.Season,
+        BaseItemDto_Type.MusicAlbum,
+        BaseItemDto_Type.MusicArtist,
+        BaseItemDto_Type.Playlist
+    };
+
+    private static readonly HashSet<BaseItemDto_Type> MediaTypes = new()
+    {
+        BaseItemDto_Type.Movie,
+        BaseItemDto_Type.Episode,
+        BaseItemDto_Type.Audio,
+        BaseItemDto_Type.Photo,
+        BaseItemDto_Type.Video,
+        BaseItemDto_Type.AudioBook
+    };
+
+    public ContentDirectoryService(
+        ILogger<ContentDirectoryService> logger,
+        JellyfinService jellyfinService,
+        DeviceProfileService deviceProfileService,
+        XmlTemplateService xmlTemplateService)
     {
         _logger = logger;
         _jellyfinService = jellyfinService;
+        _deviceProfileService = deviceProfileService;
+        _xmlTemplateService = xmlTemplateService;
     }
 
     // MARK: GetServiceDescriptionXml
     public string GetServiceDescriptionXml()
     {
-        return """
-        <?xml version="1.0"?>
-        <scpd xmlns="urn:schemas-upnp-org:service-1-0">
-            <specVersion>
-                <major>1</major>
-                <minor>0</minor>
-            </specVersion>
-            <actionList>
-                <action>
-                    <name>Browse</name>
-                    <argumentList>
-                        <argument>
-                            <name>ObjectID</name>
-                            <direction>in</direction>
-                            <relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable>
-                        </argument>
-                        <argument>
-                            <name>BrowseFlag</name>
-                            <direction>in</direction>
-                            <relatedStateVariable>A_ARG_TYPE_BrowseFlag</relatedStateVariable>
-                        </argument>
-                        <argument>
-                            <name>Filter</name>
-                            <direction>in</direction>
-                            <relatedStateVariable>A_ARG_TYPE_Filter</relatedStateVariable>
-                        </argument>
-                        <argument>
-                            <name>StartingIndex</name>
-                            <direction>in</direction>
-                            <relatedStateVariable>A_ARG_TYPE_Index</relatedStateVariable>
-                        </argument>
-                        <argument>
-                            <name>RequestedCount</name>
-                            <direction>in</direction>
-                            <relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable>
-                        </argument>
-                        <argument>
-                            <name>SortCriteria</name>
-                            <direction>in</direction>
-                            <relatedStateVariable>A_ARG_TYPE_SortCriteria</relatedStateVariable>
-                        </argument>
-                        <argument>
-                            <name>Result</name>
-                            <direction>out</direction>
-                            <relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable>
-                        </argument>
-                        <argument>
-                            <name>NumberReturned</name>
-                            <direction>out</direction>
-                            <relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable>
-                        </argument>
-                        <argument>
-                            <name>TotalMatches</name>
-                            <direction>out</direction>
-                            <relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable>
-                        </argument>
-                        <argument>
-                            <name>UpdateID</name>
-                            <direction>out</direction>
-                            <relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable>
-                        </argument>
-                    </argumentList>
-                </action>
-                <action>
-                    <name>GetSearchCapabilities</name>
-                    <argumentList>
-                        <argument>
-                            <name>SearchCaps</name>
-                            <direction>out</direction>
-                            <relatedStateVariable>SearchCapabilities</relatedStateVariable>
-                        </argument>
-                    </argumentList>
-                </action>
-                <action>
-                    <name>GetSortCapabilities</name>
-                    <argumentList>
-                        <argument>
-                            <name>SortCaps</name>
-                            <direction>out</direction>
-                            <relatedStateVariable>SortCapabilities</relatedStateVariable>
-                        </argument>
-                    </argumentList>
-                </action>
-            </actionList>
-            <serviceStateTable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_ObjectID</name>
-                    <dataType>string</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_BrowseFlag</name>
-                    <dataType>string</dataType>
-                    <allowedValueList>
-                        <allowedValue>BrowseMetadata</allowedValue>
-                        <allowedValue>BrowseDirectChildren</allowedValue>
-                    </allowedValueList>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_Filter</name>
-                    <dataType>string</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_Index</name>
-                    <dataType>ui4</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_Count</name>
-                    <dataType>ui4</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_SortCriteria</name>
-                    <dataType>string</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_Result</name>
-                    <dataType>string</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_UpdateID</name>
-                    <dataType>ui4</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>SearchCapabilities</name>
-                    <dataType>string</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>SortCapabilities</name>
-                    <dataType>string</dataType>
-                </stateVariable>
-            </serviceStateTable>
-        </scpd>
-        """;
+        return _xmlTemplateService.GetTemplate("ContentDirectoryServiceDescription");
     }
 
     // MARK: ProcessBrowseRequestAsync
-    public async Task<string> ProcessBrowseRequestAsync(string soapBody)
+    public async Task<string> ProcessBrowseRequestAsync(string soapBody, string? userAgent)
     {
         try
         {
             var doc = XDocument.Parse(soapBody);
-            var ns = XNamespace.Get("http://schemas.xmlsoap.org/soap/envelope/");
-            var upnpNs = XNamespace.Get("urn:schemas-upnp-org:service:ContentDirectory:1");
+            var ns = XNamespace.Get("urn:schemas-upnp-org:service:ContentDirectory:1");
+            var browseElement = doc.Descendants(ns + "Browse").FirstOrDefault();
 
-            var browseElement = doc.Descendants(upnpNs + "Browse").FirstOrDefault();
             if (browseElement == null)
             {
-                _logger.LogError("No Browse element found in SOAP request");
-                return CreateSoapFault("Invalid SOAP request");
+                _logger.LogWarning("No Browse element found in SOAP request");
+                return CreateSoapFault("Invalid Browse request");
             }
 
             var objectId = browseElement.Element("ObjectID")?.Value ?? "0";
             var browseFlag = browseElement.Element("BrowseFlag")?.Value ?? "BrowseDirectChildren";
-            var startIndex = int.Parse(browseElement.Element("StartingIndex")?.Value ?? "0");
+            var startingIndex = int.Parse(browseElement.Element("StartingIndex")?.Value ?? "0");
             var requestedCount = int.Parse(browseElement.Element("RequestedCount")?.Value ?? "0");
 
-            _logger.LogDebug("Browse request - ObjectID: {ObjectId}, BrowseFlag: {BrowseFlag}", objectId, browseFlag);
+            _logger.LogDebug("Browse request: ObjectID={ObjectId}, Flag={Flag}, Start={Start}, Count={Count}", 
+                objectId, browseFlag, startingIndex, requestedCount);
 
-            var result = await BrowseAsync(objectId, browseFlag, startIndex, requestedCount);
-            return CreateBrowseResponse(result.didl, result.numberReturned, result.totalMatches);
+            var result = await ProcessBrowseAsync(objectId, browseFlag, startingIndex, requestedCount, userAgent);
+            
+            return CreateBrowseResponse(result.DidlXml, result.NumberReturned, result.TotalMatches);
         }
         catch (Exception ex)
         {
@@ -190,246 +96,295 @@ public class ContentDirectoryService
         }
     }
 
-    // MARK: ProcessSearchCapabilitiesRequest
-    public string ProcessSearchCapabilitiesRequest()
+    // MARK: ProcessBrowseAsync
+    private async Task<BrowseResult> ProcessBrowseAsync(string objectId, string browseFlag, int startingIndex, int requestedCount, string? userAgent)
     {
-        return """
-            <?xml version="1.0"?>
-            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-                <s:Body>
-                    <u:GetSearchCapabilitiesResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
-                        <SearchCaps></SearchCaps>
-                    </u:GetSearchCapabilitiesResponse>
-                </s:Body>
-            </s:Envelope>
-            """;
-    }
-
-    // MARK: ProcessSortCapabilitiesRequest
-    public string ProcessSortCapabilitiesRequest()
-    {
-        return """
-            <?xml version="1.0"?>
-            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-                <s:Body>
-                    <u:GetSortCapabilitiesResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
-                        <SortCaps>dc:title</SortCaps>
-                    </u:GetSortCapabilitiesResponse>
-                </s:Body>
-            </s:Envelope>
-            """;
-    }
-
-    // MARK: BrowseAsync
-    private async Task<(string didl, int numberReturned, int totalMatches)> BrowseAsync(string objectId, string browseFlag, int startIndex, int requestedCount)
-    {
-        if (!_jellyfinService.IsConfigured)
-        {
-            return (CreateDidlLite(""), 0, 0);
-        }
-
-        var didlBuilder = new StringBuilder();
-        var items = new List<BaseItemDto>();
-
         if (objectId == "0")
         {
-            var libraries = await _jellyfinService.GetLibraryFoldersAsync();
-            if (libraries != null)
+            return await BrowseRootAsync();
+        }
+
+        if (objectId.StartsWith("library:"))
+        {
+            var libraryId = objectId.Substring(8);
+            if (Guid.TryParse(libraryId, out var libGuid))
             {
-                items.AddRange(libraries);
-                _logger.LogDebug("Found {Count} library folders", libraries.Count);
+                return await BrowseLibraryAsync(libGuid, startingIndex, requestedCount);
             }
         }
-        else if (Guid.TryParse(objectId, out var parentId))
+
+        if (Guid.TryParse(objectId, out var itemGuid))
         {
-            var parentItem = await _jellyfinService.GetItemAsync(parentId);
-            if (parentItem != null)
+            return await BrowseItemAsync(itemGuid, startingIndex, requestedCount);
+        }
+
+        _logger.LogWarning("Unknown object ID format: {ObjectId}", objectId);
+        return new BrowseResult { DidlXml = CreateDidlXml(""), NumberReturned = 0, TotalMatches = 0 };
+    }
+
+    // MARK: BrowseRootAsync
+    private async Task<BrowseResult> BrowseRootAsync()
+    {
+        var libraries = await _jellyfinService.GetLibraryFoldersAsync();
+        if (libraries == null)
+        {
+            _logger.LogWarning("Failed to get library folders");
+            return new BrowseResult { DidlXml = CreateDidlXml(""), NumberReturned = 0, TotalMatches = 0 };
+        }
+
+        var containers = new List<string>();
+        foreach (var library in libraries)
+        {
+            if (library.Id.HasValue)
             {
-                if (parentItem.Type == BaseItemDto_Type.CollectionFolder)
+                var container = CreateContainerXml(
+                    $"library:{library.Id.Value}",
+                    "0",
+                    library.Name ?? "Unknown",
+                    "object.container.storageFolder",
+                    library.ChildCount ?? 0,
+                    library.Id.Value
+                );
+                containers.Add(container);
+            }
+        }
+
+        var didlXml = CreateDidlXml(string.Join("", containers));
+        return new BrowseResult { DidlXml = didlXml, NumberReturned = containers.Count, TotalMatches = containers.Count };
+    }
+
+    // MARK: BrowseLibraryAsync
+    private async Task<BrowseResult> BrowseLibraryAsync(Guid libraryId, int startingIndex, int requestedCount)
+    {
+        var items = await _jellyfinService.GetItemsAsync(libraryId);
+        if (items == null)
+        {
+            _logger.LogWarning("Failed to get library content for {LibraryId}", libraryId);
+            return new BrowseResult { DidlXml = CreateDidlXml(""), NumberReturned = 0, TotalMatches = 0 };
+        }
+
+        var allResults = new List<(bool isContainer, string xml, string title)>();
+
+        foreach (var item in items)
+        {
+            if (!item.Id.HasValue || ExcludedFolderNames.Contains(item.Name ?? ""))
+                continue;
+
+            var itemType = item.Type ?? BaseItemDto_Type.Folder;
+            var itemName = item.Name ?? "Unknown";
+            
+            _logger.LogDebug("Processing library item: {Name} (Type: {Type})", itemName, itemType);
+            
+            if (ContainerTypes.Contains(itemType))
+            {
+                var containerXml = CreateContainerXml(
+                    item.Id.Value.ToString(),
+                    $"library:{libraryId}",
+                    itemName,
+                    GetUpnpClass(itemType),
+                    item.ChildCount ?? 0,
+                    item.Id.Value
+                );
+                allResults.Add((true, containerXml, itemName));
+                _logger.LogDebug("Added library container: {Name}", itemName);
+            }
+            else if (MediaTypes.Contains(itemType))
+            {
+                var itemXml = await CreateItemXmlAsync(item, $"library:{libraryId}");
+                if (!string.IsNullOrEmpty(itemXml))
                 {
-                    var childItems = await _jellyfinService.GetLibraryContentAsync(parentId);
-                    if (childItems != null)
-                    {
-                        items.AddRange(childItems);
-                        _logger.LogDebug("Found {Count} items in collection folder", childItems.Count);
-                    }
+                    allResults.Add((false, itemXml, itemName));
+                    _logger.LogDebug("Added library media item: {Name} (XML length: {Length})", itemName, itemXml.Length);
                 }
                 else
                 {
-                    var childItems = await _jellyfinService.GetItemsAsync(parentId);
-                    if (childItems != null)
-                    {
-                        var filteredItems = childItems.Where(item => item.Id != parentId).ToList();
-                        items.AddRange(filteredItems);
-                        _logger.LogDebug("Found {Count} child items for {ParentId}", filteredItems.Count, parentId);
-                    }
+                    _logger.LogWarning("Failed to create XML for library media item: {Name} (Type: {Type})", itemName, itemType);
                 }
             }
             else
             {
-                _logger.LogWarning("Could not retrieve parent item for ID: {ParentId}", parentId);
+                _logger.LogDebug("Skipped library item: {Name} (Type: {Type}) - not container or media", itemName, itemType);
             }
         }
-        else
+
+        _logger.LogInformation("BrowseLibraryAsync for {LibraryId}: Found {Total} items ({Containers} containers, {Media} media)", 
+            libraryId, allResults.Count, 
+            allResults.Count(x => x.isContainer), 
+            allResults.Count(x => !x.isContainer));
+
+        var sortedResults = allResults
+            .OrderBy(x => !x.isContainer)
+            .ThenBy(x => x.title)
+            .ToList();
+
+        var totalMatches = sortedResults.Count;
+        var paginatedResults = sortedResults
+            .Skip(startingIndex)
+            .Take(requestedCount > 0 ? requestedCount : int.MaxValue)
+            .Select(x => x.xml)
+            .ToList();
+
+        var didlXml = CreateDidlXml(string.Join("", paginatedResults));
+        return new BrowseResult { DidlXml = didlXml, NumberReturned = paginatedResults.Count, TotalMatches = totalMatches };
+    }
+
+    // MARK: BrowseItemAsync
+    private async Task<BrowseResult> BrowseItemAsync(Guid itemId, int startingIndex, int requestedCount)
+    {
+        var items = await _jellyfinService.GetItemsAsync(itemId);
+        if (items == null)
         {
-            _logger.LogWarning("Could not parse objectId as GUID: '{ObjectId}'", objectId);
+            _logger.LogWarning("Failed to get item content for {ItemId}", itemId);
+            return new BrowseResult { DidlXml = CreateDidlXml(""), NumberReturned = 0, TotalMatches = 0 };
         }
 
-        var totalMatches = items.Count;
-        var endIndex = requestedCount > 0 ? Math.Min(startIndex + requestedCount, totalMatches) : totalMatches;
-        var itemsToReturn = items.Skip(startIndex).Take(endIndex - startIndex).ToList();
+        var allResults = new List<(bool isContainer, string xml, string title)>();
 
-        foreach (var item in itemsToReturn)
+        foreach (var item in items)
         {
-            if (IsContainer(item))
+            if (!item.Id.HasValue || ExcludedFolderNames.Contains(item.Name ?? ""))
+                continue;
+
+            var itemType = item.Type ?? BaseItemDto_Type.Folder;
+            var itemName = item.Name ?? "Unknown";
+            
+            _logger.LogDebug("Processing item: {Name} (Type: {Type})", itemName, itemType);
+            
+            if (ContainerTypes.Contains(itemType))
             {
-                didlBuilder.Append(CreateContainerDidl(item));
+                var containerXml = CreateContainerXml(
+                    item.Id.Value.ToString(),
+                    itemId.ToString(),
+                    itemName,
+                    GetUpnpClass(itemType),
+                    item.ChildCount ?? 0,
+                    item.Id.Value
+                );
+                allResults.Add((true, containerXml, itemName));
+                _logger.LogDebug("Added container: {Name}", itemName);
+            }
+            else if (MediaTypes.Contains(itemType))
+            {
+                var itemXml = await CreateItemXmlAsync(item, itemId.ToString());
+                if (!string.IsNullOrEmpty(itemXml))
+                {
+                    allResults.Add((false, itemXml, itemName));
+                    _logger.LogDebug("Added media item: {Name} (XML length: {Length})", itemName, itemXml.Length);
+                }
+                else
+                {
+                    _logger.LogWarning("Failed to create XML for media item: {Name} (Type: {Type})", itemName, itemType);
+                }
             }
             else
             {
-                didlBuilder.Append(CreateItemDidl(item));
+                _logger.LogDebug("Skipped item: {Name} (Type: {Type}) - not container or media", itemName, itemType);
             }
         }
 
-        var didl = CreateDidlLite(didlBuilder.ToString());
-        return (didl, itemsToReturn.Count, totalMatches);
+        _logger.LogInformation("BrowseItemAsync for {ItemId}: Found {Total} items ({Containers} containers, {Media} media)", 
+            itemId, allResults.Count, 
+            allResults.Count(x => x.isContainer), 
+            allResults.Count(x => !x.isContainer));
+
+        var sortedResults = allResults
+            .OrderBy(x => !x.isContainer)
+            .ThenBy(x => x.title)
+            .ToList();
+
+        var totalMatches = sortedResults.Count;
+        var paginatedResults = sortedResults
+            .Skip(startingIndex)
+            .Take(requestedCount > 0 ? requestedCount : int.MaxValue)
+            .Select(x => x.xml)
+            .ToList();
+
+        var didlXml = CreateDidlXml(string.Join("", paginatedResults));
+        return new BrowseResult { DidlXml = didlXml, NumberReturned = paginatedResults.Count, TotalMatches = totalMatches };
     }
 
-    // MARK: IsContainer
-    private bool IsContainer(BaseItemDto item)
+    // MARK: CreateItemXmlAsync
+    private async Task<string> CreateItemXmlAsync(BaseItemDto item, string parentId)
     {
-        return item.IsFolder == true || 
-               item.Type == BaseItemDto_Type.Folder || 
-               item.Type == BaseItemDto_Type.CollectionFolder ||
-               item.Type == BaseItemDto_Type.UserView ||
-               item.Type == BaseItemDto_Type.MusicAlbum ||
-               item.Type == BaseItemDto_Type.Series ||
-               item.Type == BaseItemDto_Type.Season;
-    }
-
-    // MARK: CreateContainerDidl
-    private string CreateContainerDidl(BaseItemDto item)
-    {
-        var upnpClass = GetUpnpClass(item);
-        var title = System.Security.SecurityElement.Escape(item.Name ?? "Unknown");
-        var imageUrl = _jellyfinService.GetImageUrlAsync(item.Id ?? Guid.Empty, ImageType.Primary);
-        var parentId = item.ParentId?.ToString() ?? "0";
-        
-        var albumArt = !string.IsNullOrEmpty(imageUrl) 
-            ? $"<upnp:albumArtURI>{System.Security.SecurityElement.Escape(imageUrl)}</upnp:albumArtURI>"
-            : "";
-        
-        return $"""
-            <container id="{item.Id}" parentID="{parentId}" restricted="1" searchable="1">
-                <dc:title>{title}</dc:title>
-                <upnp:class>{upnpClass}</upnp:class>
-                <upnp:writeStatus>NOT_WRITABLE</upnp:writeStatus>
-                {albumArt}
-            </container>
-            """;
-    }
-
-    // MARK: CreateItemDidl
-    private string CreateItemDidl(BaseItemDto item)
-    {
-        var upnpClass = GetUpnpClass(item);
-        var title = System.Security.SecurityElement.Escape(item.Name ?? "Unknown");
-        var streamUrl = GetLocalStreamUrl(item.Id ?? Guid.Empty);
-        var mimeType = GetMimeType(item);
-        var size = GetItemSize(item);
-        var imageUrl = _jellyfinService.GetImageUrlAsync(item.Id ?? Guid.Empty, ImageType.Primary);
-        var parentId = item.ParentId?.ToString() ?? "0";
-        
-        if (string.IsNullOrEmpty(streamUrl))
+        if (!item.Id.HasValue) 
         {
+            _logger.LogWarning("CreateItemXmlAsync: Item has no ID");
             return "";
         }
 
-        var duration = "";
-        if (item.RunTimeTicks.HasValue)
+        var streamUrl = _jellyfinService.GetStreamUrlAsync(item.Id.Value);
+        if (string.IsNullOrEmpty(streamUrl))
         {
-            var timeSpan = TimeSpan.FromTicks(item.RunTimeTicks.Value);
-            duration = $"{timeSpan.Hours:D2}:{timeSpan.Minutes:D2}:{timeSpan.Seconds:D2}";
+            _logger.LogWarning("CreateItemXmlAsync: No stream URL for item {ItemId}", item.Id.Value);
+            return "";
         }
 
-        var durationAttr = !string.IsNullOrEmpty(duration) ? $" duration=\"{duration}\"" : "";
-        var resources = $"""<res protocolInfo="http-get:*:{mimeType}:*" size="{size}"{durationAttr}>{System.Security.SecurityElement.Escape(streamUrl)}</res>""";
-        
-        var albumArt = !string.IsNullOrEmpty(imageUrl) 
-            ? $"<upnp:albumArtURI>{System.Security.SecurityElement.Escape(imageUrl)}</upnp:albumArtURI>"
-            : "";
+        var mimeType = GetMimeTypeFromItem(item);
+        var upnpClass = GetUpnpClass(item.Type ?? BaseItemDto_Type.Video);
+        var duration = FormatDuration(item.RunTimeTicks);
+        var size = item.MediaSources?.FirstOrDefault()?.Size ?? 0;
+        var resolution = GetResolution(item);
 
+        var title = System.Security.SecurityElement.Escape(item.Name ?? "Unknown");
+        var albumArtUrl = GetAlbumArtUrl(item.Id.Value);
+        
+        var albumArtXml = !string.IsNullOrEmpty(albumArtUrl) ? 
+            $"<upnp:albumArtURI>{albumArtUrl}</upnp:albumArtURI>" : "";
+        
+        var resolutionAttr = !string.IsNullOrEmpty(resolution) ? $" resolution=\"{resolution}\"" : "";
+        
+        _logger.LogDebug("Creating media item XML: {Title} (Type: {Type}, MIME: {MimeType})", 
+            title, item.Type, mimeType);
+        
         return $"""
-            <item id="{item.Id}" parentID="{parentId}" restricted="1">
+            <item id="{item.Id.Value}" parentID="{parentId}" restricted="1">
                 <dc:title>{title}</dc:title>
                 <upnp:class>{upnpClass}</upnp:class>
-                <upnp:writeStatus>NOT_WRITABLE</upnp:writeStatus>
-                {albumArt}
-                {resources}
+                {albumArtXml}
+                <res protocolInfo="http-get:*:{mimeType}:*" size="{size}" duration="{duration}"{resolutionAttr}>{streamUrl}</res>
             </item>
             """;
     }
 
-    // MARK: GetLocalStreamUrl
-    private string GetLocalStreamUrl(Guid itemId)
+    // MARK: CreateContainerXml
+    private string CreateContainerXml(string id, string parentId, string title, string upnpClass, int childCount, Guid? itemId = null)
     {
-        var localIp = GetLocalIPAddress();
-        return $"http://{localIp}:8200/stream/{itemId}";
+        var escapedTitle = System.Security.SecurityElement.Escape(title);
+        var albumArtUrl = itemId.HasValue ? GetAlbumArtUrl(itemId.Value) : "";
+        var albumArtXml = !string.IsNullOrEmpty(albumArtUrl) ? 
+            $"<upnp:albumArtURI>{albumArtUrl}</upnp:albumArtURI>" : "";
+        
+        return $"""
+            <container id="{id}" parentID="{parentId}" restricted="1" childCount="{childCount}">
+                <dc:title>{escapedTitle}</dc:title>
+                <upnp:class>{upnpClass}</upnp:class>
+                {albumArtXml}
+            </container>
+            """;
     }
 
-    // MARK: GetLocalIPAddress
-    private string GetLocalIPAddress()
+    // MARK: GetAlbumArtUrl
+    private string GetAlbumArtUrl(Guid itemId)
     {
-        var host = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName());
-        foreach (var ip in host.AddressList)
+        return _jellyfinService.GetImageUrlAsync(itemId, ImageType.Primary) ?? "";
+    }
+
+    // MARK: GetResolution
+    private string GetResolution(BaseItemDto item)
+    {
+        var videoStream = item.MediaSources?.FirstOrDefault()?.MediaStreams?
+            .FirstOrDefault(s => s.Type == MediaStream_Type.Video);
+        
+        if (videoStream?.Width.HasValue == true && videoStream?.Height.HasValue == true)
         {
-            if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !System.Net.IPAddress.IsLoopback(ip))
-            {
-                return ip.ToString();
-            }
+            return $"{videoStream.Width}x{videoStream.Height}";
         }
-        return "127.0.0.1";
+        
+        return "";
     }
 
-    // MARK: GetItemSize
-    private long GetItemSize(BaseItemDto item)
-    {
-        var mediaSource = item.MediaSources?.FirstOrDefault();
-        return mediaSource?.Size ?? 0;
-    }
-
-    // MARK: GetUpnpClass
-    private string GetUpnpClass(BaseItemDto item)
-    {
-        return item.Type switch
-        {
-            BaseItemDto_Type.Movie => "object.item.videoItem.movie",
-            BaseItemDto_Type.Episode => "object.item.videoItem.videoBroadcast",
-            BaseItemDto_Type.Audio => "object.item.audioItem.musicTrack",
-            BaseItemDto_Type.Photo => "object.item.imageItem.photo",
-            BaseItemDto_Type.MusicAlbum => "object.container.album.musicAlbum",
-            BaseItemDto_Type.Series => "object.container.person.movieGenre",
-            BaseItemDto_Type.Season => "object.container",
-            BaseItemDto_Type.CollectionFolder => "object.container.storageFolder",
-            BaseItemDto_Type.Folder => "object.container.storageFolder",
-            _ => "object.container"
-        };
-    }
-
-    // MARK: GetMimeType
-    private string GetMimeType(BaseItemDto item)
-    {
-        return item.Type switch
-        {
-            BaseItemDto_Type.Movie or BaseItemDto_Type.Episode => "video/mp4",
-            BaseItemDto_Type.Audio => "audio/mpeg",
-            BaseItemDto_Type.Photo => "image/jpeg",
-            _ => "application/octet-stream"
-        };
-    }
-
-    // MARK: CreateDidlLite
-    private string CreateDidlLite(string content)
+    // MARK: CreateDidlXml
+    private string CreateDidlXml(string content)
     {
         return $"""
             <DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" 
@@ -440,39 +395,92 @@ public class ContentDirectoryService
             """;
     }
 
-    // MARK: CreateBrowseResponse
-    private string CreateBrowseResponse(string didl, int numberReturned, int totalMatches)
+    // MARK: GetUpnpClass
+    private string GetUpnpClass(BaseItemDto_Type itemType)
     {
-        var escapedDidl = System.Security.SecurityElement.Escape(didl);
+        return itemType switch
+        {
+            BaseItemDto_Type.Movie => "object.item.videoItem.movie",
+            BaseItemDto_Type.Episode => "object.item.videoItem",
+            BaseItemDto_Type.Series => "object.container.album.videoAlbum",
+            BaseItemDto_Type.Season => "object.container.album.videoAlbum",
+            BaseItemDto_Type.Audio => "object.item.audioItem.musicTrack",
+            BaseItemDto_Type.MusicAlbum => "object.container.album.musicAlbum",
+            BaseItemDto_Type.MusicArtist => "object.container.person.musicArtist",
+            BaseItemDto_Type.Photo => "object.item.imageItem.photo",
+            BaseItemDto_Type.Video => "object.item.videoItem",
+            BaseItemDto_Type.CollectionFolder => "object.container.storageFolder",
+            _ => "object.container.storageFolder"
+        };
+    }
+
+    // MARK: GetMimeTypeFromItem
+    private string GetMimeTypeFromItem(BaseItemDto item)
+    {
+        var mediaSource = item.MediaSources?.FirstOrDefault();
+        var container = mediaSource?.Container?.ToLowerInvariant();
+
+        return container switch
+        {
+            "mp4" => "video/mp4",
+            "mkv" => "video/x-matroska",
+            "avi" => "video/x-msvideo",
+            "mov" => "video/quicktime",
+            "wmv" => "video/x-ms-wmv",
+            "webm" => "video/webm",
+            "mp3" => "audio/mpeg",
+            "flac" => "audio/flac",
+            "aac" => "audio/aac",
+            "wav" => "audio/wav",
+            "ogg" => "audio/ogg",
+            "m4a" => "audio/mp4",
+            "jpg" or "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            _ => "application/octet-stream"
+        };
+    }
+
+    // MARK: FormatDuration
+    private string FormatDuration(long? runTimeTicks)
+    {
+        if (!runTimeTicks.HasValue) return "0:00:00";
         
-        return $"""
-            <?xml version="1.0"?>
-            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-                <s:Body>
-                    <u:BrowseResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
-                        <Result>{escapedDidl}</Result>
-                        <NumberReturned>{numberReturned}</NumberReturned>
-                        <TotalMatches>{totalMatches}</TotalMatches>
-                        <UpdateID>0</UpdateID>
-                    </u:BrowseResponse>
-                </s:Body>
-            </s:Envelope>
-            """;
+        var timeSpan = TimeSpan.FromTicks(runTimeTicks.Value);
+        return $"{(int)timeSpan.TotalHours:00}:{timeSpan.Minutes:00}:{timeSpan.Seconds:00}";
+    }
+
+    // MARK: ProcessSearchCapabilitiesRequest
+    public string ProcessSearchCapabilitiesRequest()
+    {
+        return _xmlTemplateService.GetTemplate("SearchCapabilitiesResponse", "");
+    }
+
+    // MARK: ProcessSortCapabilitiesRequest
+    public string ProcessSortCapabilitiesRequest()
+    {
+        return _xmlTemplateService.GetTemplate("SortCapabilitiesResponse", "dc:title,dc:date,upnp:class");
+    }
+
+    // MARK: CreateBrowseResponse
+    private string CreateBrowseResponse(string result, int numberReturned, int totalMatches)
+    {
+        var escapedResult = System.Security.SecurityElement.Escape(result);
+        return _xmlTemplateService.GetTemplate("BrowseResponse", escapedResult, numberReturned, totalMatches);
     }
 
     // MARK: CreateSoapFault
     private string CreateSoapFault(string error)
     {
-        return $"""
-            <?xml version="1.0"?>
-            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
-                <s:Body>
-                    <s:Fault>
-                        <faultcode>s:Client</faultcode>
-                        <faultstring>{System.Security.SecurityElement.Escape(error)}</faultstring>
-                    </s:Fault>
-                </s:Body>
-            </s:Envelope>
-            """;
+        var escapedError = System.Security.SecurityElement.Escape(error);
+        return _xmlTemplateService.GetTemplate("SoapFault", escapedError);
     }
+}
+
+// MARK: BrowseResult
+public class BrowseResult
+{
+    public string DidlXml { get; set; } = string.Empty;
+    public int NumberReturned { get; set; }
+    public int TotalMatches { get; set; }
 }

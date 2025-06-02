@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+    <s:Body>
+        <s:Fault>
+            <faultcode>s:Server</faultcode>
+            <faultstring>{0}</faultstring>
+        </s:Fault>
+    </s:Body>
+</s:Envelope>
