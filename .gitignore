@@ -5,6 +5,11 @@ obj/
 # Configuration files
 appsettings.json
 
+# Data files
+*.db
+*.db-shm
+*.db-wal
+
 # Visual Studio
 .vs/
 *.user
