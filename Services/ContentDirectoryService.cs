@@ -238,7 +238,7 @@ public class ContentDirectoryService
             return new BrowseResult { DidlXml = CreateDidlXml(""), NumberReturned = 0, TotalMatches = 0 };
         }
 
-        var allResults = new List<(bool isContainer, string xml, string title)>();
+        var allResults = new List<(BaseItemDto item, bool isContainer, string xml, string title)>();
 
         foreach (var item in items)
         {
@@ -247,9 +247,9 @@ public class ContentDirectoryService
 
             var itemType = item.Type ?? BaseItemDto_Type.Folder;
             var itemName = item.Name ?? "Unknown";
-            
+
             _logger.LogDebug("Processing item: {Name} (Type: {Type})", itemName, itemType);
-            
+
             if (ContainerTypes.Contains(itemType))
             {
                 var containerXml = CreateContainerXml(
@@ -260,7 +260,7 @@ public class ContentDirectoryService
                     item.ChildCount ?? 0,
                     item.Id.Value
                 );
-                allResults.Add((true, containerXml, itemName));
+                allResults.Add((item, true, containerXml, itemName));
                 _logger.LogDebug("Added container: {Name}", itemName);
             }
             else if (MediaTypes.Contains(itemType))
@@ -268,7 +268,7 @@ public class ContentDirectoryService
                 var itemXml = CreateItemXml(item, itemId.ToString());
                 if (!string.IsNullOrEmpty(itemXml))
                 {
-                    allResults.Add((false, itemXml, itemName));
+                    allResults.Add((item, false, itemXml, itemName));
                     _logger.LogDebug("Added media item: {Name} (XML length: {Length})", itemName, itemXml.Length);
                 }
                 else
@@ -289,6 +289,9 @@ public class ContentDirectoryService
 
         var sortedResults = allResults
             .OrderBy(x => !x.isContainer)
+            .ThenBy(x => x.item.Type == BaseItemDto_Type.Episode 
+                ? x.item.IndexNumber ?? int.MaxValue 
+                : int.MaxValue)
             .ThenBy(x => x.title)
             .ToList();
 
@@ -300,7 +303,12 @@ public class ContentDirectoryService
             .ToList();
 
         var didlXml = CreateDidlXml(string.Join("", paginatedResults));
-        return new BrowseResult { DidlXml = didlXml, NumberReturned = paginatedResults.Count, TotalMatches = totalMatches };
+        return new BrowseResult 
+        { 
+            DidlXml = didlXml, 
+            NumberReturned = paginatedResults.Count, 
+            TotalMatches = totalMatches 
+        };
     }
 
     // MARK: CreateItemXml
@@ -325,7 +333,11 @@ public class ContentDirectoryService
         var size = item.MediaSources?.FirstOrDefault()?.Size ?? 0;
         var resolution = GetResolution(item);
 
-        var title = System.Security.SecurityElement.Escape(item.Name ?? "Unknown");
+        var title = System.Security.SecurityElement.Escape(
+            item.Type == BaseItemDto_Type.Episode 
+                ? $"{item.IndexNumber}. {item.Name ?? "Unknown"}" 
+                : item.Name ?? "Unknown"
+        );
         var albumArtUrl = GetAlbumArtUrl(item.Id.Value);
         
         var albumArtXml = !string.IsNullOrEmpty(albumArtUrl) ? 
