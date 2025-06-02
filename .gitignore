@@ -4,7 +4,6 @@ obj/
 
 # Configuration files
 appsettings.json
-appsettings.*.json
 
 # Visual Studio
 .vs/
