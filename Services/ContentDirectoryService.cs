@@ -190,7 +190,7 @@ public class ContentDirectoryService
             }
             else if (MediaTypes.Contains(itemType))
             {
-                var itemXml = await CreateItemXmlAsync(item, $"library:{libraryId}");
+                var itemXml = CreateItemXml(item, $"library:{libraryId}");
                 if (!string.IsNullOrEmpty(itemXml))
                 {
                     allResults.Add((false, itemXml, itemName));
@@ -265,7 +265,7 @@ public class ContentDirectoryService
             }
             else if (MediaTypes.Contains(itemType))
             {
-                var itemXml = await CreateItemXmlAsync(item, itemId.ToString());
+                var itemXml = CreateItemXml(item, itemId.ToString());
                 if (!string.IsNullOrEmpty(itemXml))
                 {
                     allResults.Add((false, itemXml, itemName));
@@ -303,19 +303,19 @@ public class ContentDirectoryService
         return new BrowseResult { DidlXml = didlXml, NumberReturned = paginatedResults.Count, TotalMatches = totalMatches };
     }
 
-    // MARK: CreateItemXmlAsync
-    private async Task<string> CreateItemXmlAsync(BaseItemDto item, string parentId)
+    // MARK: CreateItemXml
+    private string CreateItemXml(BaseItemDto item, string parentId)
     {
         if (!item.Id.HasValue) 
         {
-            _logger.LogWarning("CreateItemXmlAsync: Item has no ID");
+            _logger.LogWarning("CreateItemXml: Item has no ID");
             return "";
         }
 
         var streamUrl = _jellyfinService.GetStreamUrlAsync(item.Id.Value);
         if (string.IsNullOrEmpty(streamUrl))
         {
-            _logger.LogWarning("CreateItemXmlAsync: No stream URL for item {ItemId}", item.Id.Value);
+            _logger.LogWarning("CreateItemXml: No stream URL for item {ItemId}", item.Id.Value);
             return "";
         }
 

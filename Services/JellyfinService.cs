@@ -150,6 +150,15 @@ public class JellyfinService
                 
                 requestConfiguration.QueryParameters.SortBy = [ItemSortBy.SortName];
                 requestConfiguration.QueryParameters.SortOrder = [SortOrder.Ascending];
+                
+                requestConfiguration.QueryParameters.Fields = [
+                    ItemFields.MediaSources,
+                    ItemFields.MediaStreams,
+                    ItemFields.Path,
+                    ItemFields.Overview,
+                    ItemFields.ProviderIds,
+                    ItemFields.SortName
+                ];
             });
             
             _logger.LogDebug("Retrieved {Count} items for parent {ParentId}", response?.Items?.Count ?? 0, parentId);
