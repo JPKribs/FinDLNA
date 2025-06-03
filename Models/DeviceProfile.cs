@@ -2,6 +2,7 @@ using System.ComponentModel.DataAnnotations;
 
 namespace FinDLNA.Models;
 
+// MARK: DeviceProfile
 public class DeviceProfile
 {
     [Key]
@@ -41,28 +42,28 @@ public class DeviceProfile
     public bool IsActive { get; set; } = true;
 }
 
+// MARK: DirectPlayProfile
 public class DirectPlayProfile
 {
     [Key]
     public int Id { get; set; }
-    
     public int DeviceProfileId { get; set; }
     public DeviceProfile DeviceProfile { get; set; } = null!;
-    
     public string Container { get; set; } = string.Empty;
     public string AudioCodec { get; set; } = string.Empty;
     public string VideoCodec { get; set; } = string.Empty;
     public string Type { get; set; } = string.Empty;
 }
 
+// MARK: TranscodingProfile
 public class TranscodingProfile
 {
     [Key]
     public int Id { get; set; }
-    
+
     public int DeviceProfileId { get; set; }
     public DeviceProfile DeviceProfile { get; set; } = null!;
-    
+
     public string Container { get; set; } = string.Empty;
     public string Type { get; set; } = string.Empty;
     public string VideoCodec { get; set; } = string.Empty;
@@ -80,26 +81,28 @@ public class TranscodingProfile
     public bool BreakOnNonKeyFrames { get; set; } = false;
 }
 
+// MARK: ContainerProfile
 public class ContainerProfile
 {
     [Key]
     public int Id { get; set; }
-    
+
     public int DeviceProfileId { get; set; }
     public DeviceProfile DeviceProfile { get; set; } = null!;
-    
+
     public string Type { get; set; } = string.Empty;
     public string Container { get; set; } = string.Empty;
 }
 
+// MARK: CodecProfile
 public class CodecProfile
 {
     [Key]
     public int Id { get; set; }
-    
+
     public int DeviceProfileId { get; set; }
     public DeviceProfile DeviceProfile { get; set; } = null!;
-    
+
     public string Type { get; set; } = string.Empty;
     public string Codec { get; set; } = string.Empty;
     public string Container { get; set; } = string.Empty;

@@ -702,11 +702,3 @@ public class ContentDirectoryService
         return _xmlTemplateService.GetTemplate("SoapFault", escapedError);
     }
 }
-
-// MARK: BrowseResult
-public class BrowseResult
-{
-    public string DidlXml { get; set; } = string.Empty;
-    public int NumberReturned { get; set; }
-    public int TotalMatches { get; set; }
-}

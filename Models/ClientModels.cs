@@ -1,5 +1,6 @@
 namespace FinDLNA.Models;
 
+// MARK: JellyfinClientOptions
 public class JellyfinClientOptions
 {
     public string AppName { get; set; } = default!;

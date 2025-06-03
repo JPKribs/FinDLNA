@@ -1,5 +1,6 @@
 namespace FinDLNA.Models;
 
+// MARK: DlnaDevice
 public class DlnaDevice
 {
     public string Uuid { get; set; } = Guid.NewGuid().ToString();
@@ -10,6 +11,7 @@ public class DlnaDevice
     public int Port { get; set; } = 8200;
 }
 
+// MARK: DlnaContainer
 public class DlnaContainer
 {
     public string Id { get; set; } = string.Empty;
@@ -21,6 +23,7 @@ public class DlnaContainer
     public bool Searchable { get; set; } = true;
 }
 
+// MARK: DlnaItem
 public class DlnaItem
 {
     public string Id { get; set; } = string.Empty;
@@ -33,4 +36,12 @@ public class DlnaItem
     public string Duration { get; set; } = string.Empty;
     public string Resolution { get; set; } = string.Empty;
     public bool Restricted { get; set; } = true;
+}
+
+// MARK: BrowseResult
+public class BrowseResult
+{
+    public string DidlXml { get; set; } = string.Empty;
+    public int NumberReturned { get; set; }
+    public int TotalMatches { get; set; }
 }
