@@ -3,7 +3,6 @@ using System.Text;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using FinDLNA.Services;
-using Jellyfin.Sdk.Generated.Models;
 
 namespace FinDLNA.Services;
 
@@ -16,18 +15,9 @@ public class DlnaService : IDisposable
     private readonly ContentDirectoryService _contentDirectoryService;
     private readonly JellyfinService _jellyfinService;
     private readonly StreamingService _streamingService;
+    private readonly XmlTemplateService _xmlTemplateService;
     private HttpListener? _httpListener;
     private bool _isRunning;
-
-    private static readonly HashSet<string> UnsupportedSubtitleCodecs = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "pgs", "pgssub", "dvdsub", "dvbsub", "hdmv_pgs_subtitle", "presentation_graphics_stream"
-    };
-
-    private static readonly HashSet<string> SupportedSubtitleCodecs = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "srt", "subrip", "ass", "ssa", "vtt", "webvtt", "sub", "idx"
-    };
 
     public DlnaService(
         ILogger<DlnaService> logger, 
@@ -35,7 +25,8 @@ public class DlnaService : IDisposable
         SsdpService ssdpService,
         ContentDirectoryService contentDirectoryService,
         JellyfinService jellyfinService,
-        StreamingService streamingService)
+        StreamingService streamingService,
+        XmlTemplateService xmlTemplateService)
     {
         _logger = logger;
         _configuration = configuration;
@@ -43,6 +34,7 @@ public class DlnaService : IDisposable
         _contentDirectoryService = contentDirectoryService;
         _jellyfinService = jellyfinService;
         _streamingService = streamingService;
+        _xmlTemplateService = xmlTemplateService;
     }
 
     // MARK: StartAsync
@@ -114,65 +106,75 @@ public class DlnaService : IDisposable
         var path = request.Url?.AbsolutePath ?? "";
         var userAgent = request.UserAgent ?? "";
 
-        _logger.LogDebug("DLNA request: {Method} {Path} from {UserAgent}", request.HttpMethod, path, userAgent);
+        _logger.LogInformation("DLNA REQUEST: {Method} {Path} from {UserAgent} at {RemoteEndPoint}", 
+            request.HttpMethod, path, userAgent, request.RemoteEndPoint);
 
         try
         {
             switch (path)
             {
                 case "/device.xml":
+                    _logger.LogDebug("Serving device description");
                     await HandleDeviceDescription(response);
                     break;
 
                 case "/ContentDirectory/scpd.xml":
+                    _logger.LogDebug("Serving ContentDirectory service description");
                     await HandleServiceDescription(response);
                     break;
 
                 case "/ContentDirectory/control":
+                    _logger.LogDebug("Handling ContentDirectory control request");
                     await HandleContentDirectoryControl(request, response);
                     break;
 
                 case "/ContentDirectory/event":
+                    _logger.LogDebug("Handling ContentDirectory event subscription");
                     await HandleEventSubscription(request, response);
                     break;
 
                 case "/ConnectionManager/scpd.xml":
+                    _logger.LogDebug("Serving ConnectionManager service description");
                     await HandleConnectionManagerDescription(response);
                     break;
 
                 case "/ConnectionManager/control":
+                    _logger.LogDebug("Handling ConnectionManager control request");
                     await HandleConnectionManagerControl(request, response);
                     break;
 
                 case "/ConnectionManager/event":
+                    _logger.LogDebug("Handling ConnectionManager event subscription");
                     await HandleEventSubscription(request, response);
-                    break;
-
-                case var p when p.StartsWith("/subtitle/"):
-                    var pathParts = path.Split('/');
-                    if (pathParts.Length >= 4 && Guid.TryParse(pathParts[2], out var subItemId) && int.TryParse(pathParts[3], out var streamIndex))
-                    {
-                        await HandleSubtitleRequest(context, subItemId, streamIndex);
-                    }
-                    else
-                    {
-                        _logger.LogWarning("Invalid subtitle path: {Path}", path);
-                        response.StatusCode = 400;
-                        response.Close();
-                    }
                     break;
 
                 default:
                     if (path.StartsWith("/stream/"))
                     {
                         var itemId = path.Substring(8);
+                        _logger.LogInformation("STREAM REQUEST DETECTED: Path={Path}, ItemId={ItemId}, UserAgent={UserAgent}", 
+                            path, itemId, userAgent);
+                        
+                        if (string.IsNullOrEmpty(itemId))
+                        {
+                            _logger.LogWarning("Empty item ID in stream request");
+                            response.StatusCode = 400;
+                            response.Close();
+                            return;
+                        }
+
+                        _logger.LogInformation("Forwarding to StreamingService for item {ItemId}", itemId);
                         await _streamingService.HandleStreamRequest(context, itemId);
                         return;
                     }
                     else
                     {
-                        _logger.LogDebug("Unknown path requested: {Path}", path);
+                        _logger.LogWarning("Unknown path requested: {Path}", path);
                         response.StatusCode = 404;
+                        var errorMessage = $"Path not found: {path}";
+                        var errorBytes = Encoding.UTF8.GetBytes(errorMessage);
+                        response.ContentLength64 = errorBytes.Length;
+                        await response.OutputStream.WriteAsync(errorBytes);
                         response.Close();
                     }
                     break;
@@ -184,6 +186,10 @@ public class DlnaService : IDisposable
             try
             {
                 response.StatusCode = 500;
+                var errorMessage = $"Internal server error: {ex.Message}";
+                var errorBytes = Encoding.UTF8.GetBytes(errorMessage);
+                response.ContentLength64 = errorBytes.Length;
+                await response.OutputStream.WriteAsync(errorBytes);
                 response.Close();
             }
             catch (Exception closeEx)
@@ -193,171 +199,23 @@ public class DlnaService : IDisposable
         }
     }
 
-    // MARK: HandleSubtitleRequest
-    private async Task HandleSubtitleRequest(HttpListenerContext context, Guid itemId, int streamIndex)
-    {
-        try
-        {
-            _logger.LogInformation("SUBTITLE REQUEST: item {ItemId}, stream {StreamIndex} from {UserAgent}", 
-                itemId, streamIndex, context.Request.UserAgent);
-
-            var item = await _jellyfinService.GetItemAsync(itemId);
-            if (item == null)
-            {
-                _logger.LogWarning("Item {ItemId} not found for subtitle request", itemId);
-                context.Response.StatusCode = 404;
-                context.Response.Close();
-                return;
-            }
-
-            var mediaSource = item.MediaSources?.FirstOrDefault();
-            if (mediaSource?.MediaStreams == null)
-            {
-                _logger.LogWarning("No media streams found for item {ItemId}", itemId);
-                context.Response.StatusCode = 404;
-                context.Response.Close();
-                return;
-            }
-
-            var subtitleStreams = mediaSource.MediaStreams
-                .Where(s => s.Type == MediaStream_Type.Subtitle)
-                .ToList();
-
-            _logger.LogInformation("Available subtitle streams for item {ItemId} (Container: {Container}):", itemId, mediaSource.Container);
-            foreach (var stream in subtitleStreams)
-            {
-                _logger.LogInformation("  Stream Index: {Index}, Language: {Language}, Codec: {Codec}, IsExternal: {IsExternal}", 
-                    stream.Index, stream.Language, stream.Codec, stream.IsExternal);
-            }
-
-            var requestedStream = subtitleStreams.FirstOrDefault(s => s.Index == streamIndex);
-            if (requestedStream == null)
-            {
-                _logger.LogWarning("Requested subtitle stream index {StreamIndex} not found for item {ItemId}", streamIndex, itemId);
-                context.Response.StatusCode = 404;
-                context.Response.Close();
-                return;
-            }
-
-            if (!IsSubtitleSupported(requestedStream.Codec))
-            {
-                _logger.LogWarning("Subtitle stream {StreamIndex} has unsupported codec {Codec} for item {ItemId}, returning fallback", 
-                    streamIndex, requestedStream.Codec, itemId);
-                await ReturnFallbackSubtitle(context);
-                return;
-            }
-
-            _logger.LogInformation("Processing supported subtitle stream: Index={Index}, Language={Language}, Codec={Codec}", 
-                requestedStream.Index, requestedStream.Language, requestedStream.Codec);
-
-            var subtitleUrls = new[]
-            {
-                $"{_configuration["Jellyfin:ServerUrl"]?.TrimEnd('/')}/Videos/{itemId}/{streamIndex}/Subtitles.srt?X-Emby-Token={_configuration["Jellyfin:AccessToken"]}",
-                $"{_configuration["Jellyfin:ServerUrl"]?.TrimEnd('/')}/Videos/{itemId}/Subtitles/{streamIndex}/Stream.srt?X-Emby-Token={_configuration["Jellyfin:AccessToken"]}",
-                $"{_configuration["Jellyfin:ServerUrl"]?.TrimEnd('/')}/Videos/{itemId}/Subtitles/{streamIndex}?format=srt&X-Emby-Token={_configuration["Jellyfin:AccessToken"]}",
-                $"{_configuration["Jellyfin:ServerUrl"]?.TrimEnd('/')}/Videos/{itemId}/stream?StreamIndex={streamIndex}&api_key={_configuration["Jellyfin:AccessToken"]}"
-            };
-
-            foreach (var subtitleUrl in subtitleUrls)
-            {
-                _logger.LogDebug("Trying subtitle URL: {SubtitleUrl}", subtitleUrl);
-
-                using var httpClient = new HttpClient();
-                httpClient.Timeout = TimeSpan.FromSeconds(30);
-
-                try
-                {
-                    var response = await httpClient.GetAsync(subtitleUrl);
-                    if (response.IsSuccessStatusCode)
-                    {
-                        var content = await response.Content.ReadAsByteArrayAsync();
-                        
-                        var contentString = System.Text.Encoding.UTF8.GetString(content, 0, Math.Min(content.Length, 1000));
-                        if (content.Length > 10 && !contentString.Contains("<html", StringComparison.OrdinalIgnoreCase))
-                        {
-                            var contentType = response.Content.Headers.ContentType?.MediaType ?? "text/srt";
-
-                            _logger.LogInformation("Successfully serving subtitle from {SubtitleUrl}: {Length} bytes, type: {ContentType}", 
-                                subtitleUrl, content.Length, contentType);
-
-                            context.Response.ContentType = contentType;
-                            context.Response.ContentLength64 = content.Length;
-                            context.Response.AddHeader("Cache-Control", "max-age=3600");
-                            context.Response.AddHeader("Access-Control-Allow-Origin", "*");
-
-                            await context.Response.OutputStream.WriteAsync(content);
-                            context.Response.Close();
-                            return;
-                        }
-                        else
-                        {
-                            _logger.LogDebug("Got response but content appears to be error page from {SubtitleUrl}", subtitleUrl);
-                        }
-                    }
-                    else
-                    {
-                        _logger.LogDebug("Failed to fetch subtitle from {SubtitleUrl}: {StatusCode}", subtitleUrl, response.StatusCode);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogDebug(ex, "Exception trying subtitle URL {SubtitleUrl}", subtitleUrl);
-                }
-            }
-
-            _logger.LogWarning("All subtitle URL attempts failed for item {ItemId}, stream {StreamIndex}", itemId, streamIndex);
-            await ReturnFallbackSubtitle(context);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error serving subtitle for item {ItemId}, stream {StreamIndex}", itemId, streamIndex);
-            context.Response.StatusCode = 500;
-            context.Response.Close();
-        }
-    }
-
-    // MARK: IsSubtitleSupported
-    private bool IsSubtitleSupported(string? codec)
-    {
-        if (string.IsNullOrEmpty(codec))
-        {
-            _logger.LogDebug("Subtitle stream has no codec information, treating as unsupported");
-            return false;
-        }
-
-        var normalizedCodec = codec.ToLowerInvariant();
-
-        if (UnsupportedSubtitleCodecs.Contains(normalizedCodec))
-        {
-            _logger.LogDebug("Subtitle codec {Codec} is explicitly unsupported", codec);
-            return false;
-        }
-
-        if (SupportedSubtitleCodecs.Contains(normalizedCodec))
-        {
-            _logger.LogDebug("Subtitle codec {Codec} is explicitly supported", codec);
-            return true;
-        }
-
-        _logger.LogDebug("Unknown subtitle codec {Codec}, treating as supported for conversion attempt", codec);
-        return true;
-    }
-
-    // MARK: ReturnFallbackSubtitle
-    private async Task ReturnFallbackSubtitle(HttpListenerContext context)
-    {
-        var fallbackContent = System.Text.Encoding.UTF8.GetBytes("1\n00:00:00,000 --> 00:00:01,000\n[No subtitles available]\n");
-        context.Response.ContentType = "text/srt";
-        context.Response.ContentLength64 = fallbackContent.Length;
-        await context.Response.OutputStream.WriteAsync(fallbackContent);
-        context.Response.Close();
-    }
-
     // MARK: HandleDeviceDescription
     private async Task HandleDeviceDescription(HttpListenerResponse response)
     {
-        var xml = _ssdpService.GetDeviceDescriptionXml();
-        await WriteXmlResponse(response, xml, "max-age=1800");
+        try
+        {
+            var xml = _ssdpService.GetDeviceDescriptionXml();
+            _logger.LogInformation("DEVICE DESCRIPTION: Serving device.xml ({Length} chars)", xml.Length);
+            _logger.LogDebug("DEVICE DESCRIPTION XML: {Xml}", xml);
+            
+            await WriteXmlResponse(response, xml, "max-age=1800");
+            _logger.LogDebug("DEVICE DESCRIPTION: Response sent successfully");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error serving device description");
+            throw;
+        }
     }
 
     // MARK: HandleServiceDescription
@@ -472,7 +330,7 @@ public class DlnaService : IDisposable
     // MARK: HandleConnectionManagerDescription
     private async Task HandleConnectionManagerDescription(HttpListenerResponse response)
     {
-        var xml = GetConnectionManagerDescriptionXml();
+        var xml = _xmlTemplateService.GetTemplate("ConnectionManagerServiceDescription");
         await WriteXmlResponse(response, xml, "max-age=1800");
     }
 
@@ -647,10 +505,8 @@ public class DlnaService : IDisposable
             "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_MP_SD_AAC_MULT5;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
             "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_MP_HD_720p_AAC;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
             "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_MP_HD_1080i_AAC;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
-            "http-get:*:video/x-matroska:*",
-            "http-get:*:video/avi:*",
             "http-get:*:audio/mpeg:DLNA.ORG_PN=MP3;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
-            "http-get:*:audio/mp4:DLNA.ORG_PN=AAC_ISO_320;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+            "http-get:*:audio/mp4:DLNA.ORG_PN=AAC_ISO_320;DLNA.OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000",
             "http-get:*:audio/flac:*",
             "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_SM;DLNA.ORG_OP=00;DLNA.ORG_FLAGS=00D00000000000000000000000000000",
             "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_MED;DLNA.ORG_OP=00;DLNA.ORG_FLAGS=00D00000000000000000000000000000",

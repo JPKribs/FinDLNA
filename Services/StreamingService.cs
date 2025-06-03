@@ -38,8 +38,11 @@ public class StreamingService
         string? sessionId = null;
         Guid? itemGuid = null;
 
-        _logger.LogInformation("STREAM REQUEST: Handling stream request for item {ItemId} from {UserAgent} at {RemoteEndPoint}",
+        _logger.LogInformation("STREAMING SERVICE: HandleStreamRequest called for item {ItemId} from {UserAgent} at {RemoteEndPoint}",
             itemId, context.Request.UserAgent, context.Request.RemoteEndPoint);
+        
+        _logger.LogInformation("STREAMING SERVICE: Request headers: {Headers}", 
+            string.Join(", ", context.Request.Headers.AllKeys.Select(k => $"{k}={context.Request.Headers[k]}")));
 
         try
         {
@@ -55,20 +58,16 @@ public class StreamingService
             var clientEndpoint = context.Request.RemoteEndPoint?.ToString() ?? "";
             var deviceProfile = await _deviceProfileService.GetProfileAsync(userAgent);
 
-            // Get user's playback position for resume functionality
             var resumePositionTicks = await GetResumePositionAsync(guid);
             var shouldResume = resumePositionTicks > 0;
 
-            // Check if this is a resume/seek request from an existing session
             var existingSession = await _playbackReportingService.GetSessionByItemAsync(guid);
             if (existingSession != null && !string.IsNullOrEmpty(context.Request.Headers["Range"]))
             {
-                // This is likely a seek/resume request
                 _logger.LogInformation("RESUME/SEEK: Existing session {SessionId} for item {ItemId}",
                     existingSession.SessionId, itemId);
                 sessionId = existingSession.SessionId;
 
-                // If session was paused, resume it
                 if (existingSession.IsPaused)
                 {
                     await _playbackReportingService.ResumePlaybackAsync(sessionId, existingSession.LastPositionTicks);
@@ -95,10 +94,11 @@ public class StreamingService
                         itemId, TimeConversionUtil.TicksToMilliseconds(resumePositionTicks));
                 }
 
-                sessionId = await _playbackReportingService.StartPlaybackAsync(guid, userAgent, clientEndpoint);
+                sessionId = await _playbackReportingService.StartPlaybackAsync(guid, userAgent, clientEndpoint, shouldResume ? resumePositionTicks : null);
                 if (sessionId != null)
                 {
-                    _logger.LogInformation("Started playback session {SessionId} for item {ItemId}", sessionId, itemId);
+                    _logger.LogInformation("Started playback session {SessionId} for item {ItemId} with resume position {ResumeMs}ms", 
+                        sessionId, itemId, shouldResume ? TimeConversionUtil.TicksToMilliseconds(resumePositionTicks) : 0);
                 }
                 else
                 {
@@ -106,7 +106,6 @@ public class StreamingService
                 }
             }
 
-            // Get item data for streaming (this works for both new and existing sessions)
             var item = await _jellyfinService.GetItemAsync(guid);
             if (item == null)
             {
@@ -117,8 +116,7 @@ public class StreamingService
 
             var streamRequest = ParseStreamRequest(context, deviceProfile);
 
-            // Add resume position to stream request if needed
-            if (shouldResume && existingSession == null) // Only auto-resume for new sessions
+            if (shouldResume && existingSession == null)
             {
                 streamRequest.StartTimeTicks = resumePositionTicks;
             }
@@ -132,8 +130,8 @@ public class StreamingService
                 return;
             }
 
-            _logger.LogInformation("STREAMING: Starting media stream for item {ItemId}, session {SessionId}, direct play: {DirectPlay}, resume: {Resume}ms",
-                itemId, sessionId, streamInfo.IsDirectPlay, shouldResume && existingSession == null ? TimeConversionUtil.TicksToMilliseconds(resumePositionTicks) : 0);
+            _logger.LogInformation("STREAMING: Starting fMP4 stream for item {ItemId}, session {SessionId}, resume: {Resume}ms",
+                itemId, sessionId, shouldResume && existingSession == null ? TimeConversionUtil.TicksToMilliseconds(resumePositionTicks) : 0);
 
             await StreamMediaAsync(context, streamInfo, streamRequest, sessionId);
         }
@@ -162,7 +160,6 @@ public class StreamingService
                 return 0;
             }
 
-            // Get user data for the item to check playback position
             var userDataUrl = $"{_configuration["Jellyfin:ServerUrl"]?.TrimEnd('/')}/Users/{userId}/Items/{itemId}/UserData";
             var accessToken = _configuration["Jellyfin:AccessToken"];
 
@@ -179,11 +176,9 @@ public class StreamingService
                 if (userData.TryGetProperty("PlaybackPositionTicks", out var positionElement) &&
                     positionElement.TryGetInt64(out var positionTicks))
                 {
-                    // Only resume if not near the beginning (> 2 minutes) and not near the end (< 95%)
                     var twoMinutesInTicks = TimeConversionUtil.MinutesToTicks(2);
                     if (positionTicks > twoMinutesInTicks)
                     {
-                        // Check if we're not near the end
                         if (userData.TryGetProperty("Played", out var playedElement) &&
                             playedElement.GetBoolean() == false)
                         {
@@ -237,159 +232,38 @@ public class StreamingService
 
         try
         {
-            var mediaSource = item.MediaSources?.FirstOrDefault();
-            if (mediaSource == null)
-            {
-                _logger.LogWarning("No media sources found for item {ItemId}", item.Id);
-                return null;
-            }
-
-            var videoStream = mediaSource.MediaStreams?.FirstOrDefault(s => s.Type == Jellyfin.Sdk.Generated.Models.MediaStream_Type.Video);
-            var audioStream = mediaSource.MediaStreams?.FirstOrDefault(s => s.Type == Jellyfin.Sdk.Generated.Models.MediaStream_Type.Audio);
-
-            var mediaType = GetMediaType(item);
-            var shouldDirectPlay = await ShouldDirectPlayAsync(mediaSource, streamRequest, deviceProfile, mediaType);
-
-            if (shouldDirectPlay)
-            {
-                _logger.LogInformation("Using direct play for item {ItemId}", item.Id);
-                
-                // Build stream URL with start time if needed
-                var streamUrl = GetStreamUrl(item.Id.Value, mediaSource.Container, streamRequest.StartTimeTicks);
-                
-                return new StreamInfo
-                {
-                    Url = streamUrl,
-                    MimeType = GetMimeTypeFromContainer(mediaSource.Container),
-                    Size = mediaSource.Size ?? 0,
-                    IsDirectPlay = true,
-                    Container = mediaSource.Container,
-                    VideoCodec = videoStream?.Codec,
-                    AudioCodec = audioStream?.Codec,
-                    DurationTicks = item.RunTimeTicks ?? mediaSource.RunTimeTicks ?? 0
-                };
-            }
-            else
-            {
-                _logger.LogInformation("Using transcoding for item {ItemId}", item.Id);
-                return await GetTranscodingStreamAsync(item.Id.Value, streamRequest, deviceProfile, mediaType, item.RunTimeTicks ?? 0);
-            }
+            _logger.LogInformation("FORCING fMP4: Always using fMP4 transcoding with all tracks for item {ItemId}", item.Id);
+            
+            return await GetFmp4StreamAsync(item.Id.Value, streamRequest, deviceProfile, GetMediaType(item), item.RunTimeTicks ?? 0);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to get optimal stream for item {ItemId}", item.Id);
+            _logger.LogError(ex, "Failed to get fMP4 stream for item {ItemId}", item.Id);
             return null;
         }
     }
 
-    // MARK: GetStreamUrl
-    private string GetStreamUrl(Guid itemId, string? container = null, long? startTimeTicks = null)
+    // MARK: GetFmp4StreamAsync
+    private Task<StreamInfo?> GetFmp4StreamAsync(Guid itemId, StreamRequest streamRequest, DeviceProfile? deviceProfile, string mediaType, long durationTicks)
     {
-        var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
-        var accessToken = _configuration["Jellyfin:AccessToken"];
-
-        var queryParams = new List<string>
-        {
-            $"X-Emby-Token={accessToken}",
-            "EnableRedirection=false",
-            "EnableRemoteMedia=false"
-        };
-
-        if (!string.IsNullOrEmpty(container))
-        {
-            queryParams.Add($"Container={container}");
-        }
-
-        // Add start time for resume functionality
-        if (startTimeTicks.HasValue && startTimeTicks.Value > 0)
-        {
-            queryParams.Add($"StartTimeTicks={startTimeTicks.Value}");
-            _logger.LogInformation("Adding resume position to direct play: {Position}ms", 
-                TimeConversionUtil.TicksToMilliseconds(startTimeTicks.Value));
-        }
-
-        var queryString = string.Join("&", queryParams);
-        return $"{serverUrl}/Videos/{itemId}/stream?{queryString}";
-    }
-
-    // MARK: ShouldDirectPlayAsync
-    private Task<bool> ShouldDirectPlayAsync(Jellyfin.Sdk.Generated.Models.MediaSourceInfo mediaSource, StreamRequest streamRequest, DeviceProfile? deviceProfile, string mediaType)
-    {
-        if (deviceProfile == null || string.IsNullOrEmpty(mediaSource.Container))
-        {
-            return Task.FromResult(false);
-        }
-
-        var videoStream = mediaSource.MediaStreams?.FirstOrDefault(s => s.Type == Jellyfin.Sdk.Generated.Models.MediaStream_Type.Video);
-        var audioStream = mediaSource.MediaStreams?.FirstOrDefault(s => s.Type == Jellyfin.Sdk.Generated.Models.MediaStream_Type.Audio);
-
-        // Check if VLC can handle this format directly
-        var container = mediaSource.Container?.ToLowerInvariant();
-        var videoCodec = videoStream?.Codec?.ToLowerInvariant();
-        var audioCodec = audioStream?.Codec?.ToLowerInvariant();
-
-        // VLC handles these formats well without transcoding
-        var vlcCompatibleContainers = new[] { "mp4", "mkv", "avi", "mov" };
-        var vlcCompatibleVideoCodecs = new[] { "h264", "h.264", "avc", "hevc", "h265", "h.265" };
-        var vlcCompatibleAudioCodecs = new[] { "aac", "mp3", "ac3", "eac3", "dts" };
-
-        if (streamRequest.UserAgent.Contains("VLC", StringComparison.OrdinalIgnoreCase))
-        {
-            var containerOk = string.IsNullOrEmpty(container) || vlcCompatibleContainers.Contains(container);
-            var videoOk = string.IsNullOrEmpty(videoCodec) || vlcCompatibleVideoCodecs.Contains(videoCodec);
-            var audioOk = string.IsNullOrEmpty(audioCodec) || vlcCompatibleAudioCodecs.Contains(audioCodec);
-
-            if (containerOk && videoOk && audioOk)
-            {
-                _logger.LogInformation("VLC direct play: Container={Container}, Video={VideoCodec}, Audio={AudioCodec}",
-                    container, videoCodec, audioCodec);
-                return Task.FromResult(true);
-            }
-        }
-
-        return _deviceProfileService.ShouldDirectPlayAsync(
-            deviceProfile,
-            mediaSource.Container,
-            videoStream?.Codec,
-            audioStream?.Codec,
-            mediaType);
-    }
-
-    // MARK: GetTranscodingStreamAsync
-    private Task<StreamInfo?> GetTranscodingStreamAsync(Guid itemId, StreamRequest streamRequest, DeviceProfile? deviceProfile, string mediaType, long durationTicks)
-    {
-        var transcodingProfile = deviceProfile?.TranscodingProfiles?.FirstOrDefault(p =>
-            p.Type.Equals(mediaType, StringComparison.OrdinalIgnoreCase));
-
-        if (transcodingProfile == null)
-        {
-            transcodingProfile = new TranscodingProfile
-            {
-                Container = "mp4",
-                VideoCodec = "h264",
-                AudioCodec = "aac",
-                Type = mediaType
-            };
-        }
-
         var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
         var accessToken = _configuration["Jellyfin:AccessToken"];
         var userId = _configuration["Jellyfin:UserId"];
 
         if (string.IsNullOrEmpty(serverUrl) || string.IsNullOrEmpty(accessToken) || string.IsNullOrEmpty(userId))
         {
-            _logger.LogError("Missing Jellyfin configuration for transcoding");
+            _logger.LogError("Missing Jellyfin configuration for fMP4 streaming");
             return Task.FromResult<StreamInfo?>(null);
         }
 
-        var transcodingParams = new List<string>
+        var fmp4Params = new List<string>
         {
             $"UserId={userId}",
             $"DeviceId={_configuration["JellyfinClient:DeviceId"]}",
-            $"Container=mp4",
-            $"VideoCodec=h264",
-            $"AudioCodec=aac",
-            "TranscodingMaxAudioChannels=2",
+            "Container=mp4",
+            "VideoCodec=h264",
+            "AudioCodec=aac",
+            "TranscodingMaxAudioChannels=8",
             "BreakOnNonKeyFrames=true",
             "EnableRedirection=false",
             "EnableRemoteMedia=false",
@@ -398,44 +272,54 @@ public class StreamingService
             "TranscodeSeekInfo=Auto",
             "CopyTimestamps=false",
             "EnableMpegtsM2TsMode=false",
-            "EnableSubtitlesInManifest=false"
+            "EnableSubtitlesInManifest=true",
+            "AllowVideoStreamCopy=false",
+            "AllowAudioStreamCopy=false",
+            "RequireAvc=true",
+            "RequireNonAnamorphic=false",
+            "EnableAudioVbrEncoding=true",
+            "Context=Streaming",
+            "StreamOptions=",
+            "EnableAdaptiveBitrateStreaming=false",
+            "EnableAutoStreamCopy=false",
+            "SubtitleMethod=Encode"
         };
 
-        // Add start time for resume functionality
         if (streamRequest.StartTimeTicks.HasValue && streamRequest.StartTimeTicks.Value > 0)
         {
-            transcodingParams.Add($"StartTimeTicks={streamRequest.StartTimeTicks.Value}");
-            _logger.LogInformation("Adding resume position to transcoding: {Position}ms",
-                TimeConversionUtil.TicksToMilliseconds(streamRequest.StartTimeTicks.Value));
+            fmp4Params.Add($"StartTimeTicks={streamRequest.StartTimeTicks.Value}");
+            _logger.LogInformation("RESUME: Adding resume position to fMP4 stream: {Position}ms (ticks: {Ticks})",
+                TimeConversionUtil.TicksToMilliseconds(streamRequest.StartTimeTicks.Value), streamRequest.StartTimeTicks.Value);
         }
 
         if (streamRequest.MaxBitrate.HasValue)
         {
-            transcodingParams.Add($"VideoBitRate={streamRequest.MaxBitrate}");
-            transcodingParams.Add($"AudioBitRate=128000");
+            fmp4Params.Add($"VideoBitRate={streamRequest.MaxBitrate}");
+            fmp4Params.Add($"AudioBitRate=256000");
         }
         else if (deviceProfile?.MaxStreamingBitrate > 0)
         {
-            transcodingParams.Add($"VideoBitRate={deviceProfile.MaxStreamingBitrate}");
-            transcodingParams.Add($"AudioBitRate=128000");
+            fmp4Params.Add($"VideoBitRate={deviceProfile.MaxStreamingBitrate}");
+            fmp4Params.Add($"AudioBitRate=256000");
         }
         else
         {
-            transcodingParams.Add("VideoBitRate=8000000");
-            transcodingParams.Add("AudioBitRate=128000");
+            fmp4Params.Add("VideoBitRate=8000000");
+            fmp4Params.Add("AudioBitRate=256000");
         }
 
-        var transcodingUrl = $"{serverUrl}/Videos/{itemId}/stream.mp4?" +
-                           string.Join("&", transcodingParams) +
-                           $"&X-Emby-Token={accessToken}";
+        var fmp4Url = $"{serverUrl}/Videos/{itemId}/stream.mp4?" +
+                      string.Join("&", fmp4Params) +
+                      $"&X-Emby-Token={accessToken}";
 
-        _logger.LogInformation("Generated fMP4 transcoding URL: {TranscodingUrl}", transcodingUrl);
+        _logger.LogInformation("Generated fMP4 stream URL: {Fmp4Url}", fmp4Url);
+        _logger.LogDebug("fMP4 parameters: {Parameters}", string.Join(", ", fmp4Params));
 
         var streamInfo = new StreamInfo
         {
-            Url = transcodingUrl,
+            Url = fmp4Url,
             MimeType = "video/mp4",
-            Size = 0, // Unknown for transcoded content
+            Size = 0,
             IsDirectPlay = false,
             Container = "mp4",
             VideoCodec = "h264",
@@ -454,6 +338,7 @@ public class StreamingService
         long totalBytesStreamed = 0;
         var startTime = DateTime.UtcNow;
         long? rangeStart = null;
+        long? resumePositionTicks = streamRequest.StartTimeTicks;
 
         try
         {
@@ -462,26 +347,41 @@ public class StreamingService
 
             var requestMessage = new HttpRequestMessage(HttpMethod.Get, streamInfo.Url);
 
-            // Handle Range requests for seeking
             if (!string.IsNullOrEmpty(streamRequest.AcceptRanges))
             {
                 requestMessage.Headers.Add("Range", streamRequest.AcceptRanges);
                 _logger.LogInformation("SEEKING: Range request {Range} for session {SessionId}", streamRequest.AcceptRanges, sessionId);
 
-                // Parse range to estimate seek position
                 rangeStart = ParseRangeStart(streamRequest.AcceptRanges);
+                
+                if (rangeStart.HasValue && resumePositionTicks.HasValue)
+                {
+                    var seekPositionMs = TimeConversionUtil.TicksToMilliseconds(resumePositionTicks.Value);
+                    _logger.LogInformation("SEEK WITH RESUME: Byte range {ByteRange} with resume position {ResumeMs}ms", 
+                        rangeStart.Value, seekPositionMs);
+                }
             }
 
             var response = await httpClient.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead);
 
+            _logger.LogInformation("JELLYFIN RESPONSE: Status {StatusCode} for fMP4 request to {Url}", 
+                response.StatusCode, streamInfo.Url);
+
             if (!response.IsSuccessStatusCode)
             {
-                _logger.LogError("Jellyfin stream request failed with status {StatusCode}", response.StatusCode);
+                var errorContent = "";
+                try
+                {
+                    errorContent = await response.Content.ReadAsStringAsync();
+                }
+                catch { }
+                
+                _logger.LogError("Jellyfin fMP4 stream request failed with status {StatusCode}: {ErrorContent}", 
+                    response.StatusCode, errorContent);
                 await SendErrorResponse(context, response.StatusCode, "Stream unavailable");
                 return;
             }
 
-            // Set response headers
             context.Response.ContentType = streamInfo.MimeType;
 
             if (response.Content.Headers.ContentLength.HasValue)
@@ -490,7 +390,6 @@ public class StreamingService
                 _logger.LogDebug("Forwarding Content-Length: {Length}", response.Content.Headers.ContentLength.Value);
             }
 
-            // Forward all relevant headers from Jellyfin response
             foreach (var header in response.Headers)
             {
                 switch (header.Key.ToLowerInvariant())
@@ -510,7 +409,6 @@ public class StreamingService
                 }
             }
 
-            // Forward Content headers including Content-Range for seeking
             foreach (var header in response.Content.Headers)
             {
                 switch (header.Key.ToLowerInvariant())
@@ -528,7 +426,26 @@ public class StreamingService
                 }
             }
 
-            // Set proper status code for range requests
+            // Add comprehensive duration headers for DLNA clients
+            if (streamInfo.DurationTicks > 0)
+            {
+                var durationSeconds = TimeConversionUtil.TicksToSeconds(streamInfo.DurationTicks);
+                var durationMilliseconds = TimeConversionUtil.TicksToMilliseconds(streamInfo.DurationTicks);
+                
+                // Multiple duration headers for different client compatibility
+                context.Response.AddHeader("X-Content-Duration", durationSeconds.ToString("F3"));
+                context.Response.AddHeader("Content-Duration", durationSeconds.ToString("F0"));
+                context.Response.AddHeader("TimeSeekRange.dlna.org", $"npt=0-{durationSeconds:F3}");
+                context.Response.AddHeader("X-Content-Length", streamInfo.Size.ToString());
+                
+                // MediaInfo headers that some clients use
+                context.Response.AddHeader("X-Media-Duration", durationMilliseconds.ToString());
+                context.Response.AddHeader("X-Duration", durationSeconds.ToString("F3"));
+                
+                _logger.LogInformation("Added duration headers: {DurationSeconds}s ({DurationTicks} ticks, {DurationMs}ms)", 
+                    durationSeconds, streamInfo.DurationTicks, durationMilliseconds);
+            }
+
             if (response.StatusCode == HttpStatusCode.PartialContent)
             {
                 context.Response.StatusCode = 206;
@@ -539,25 +456,17 @@ public class StreamingService
                 context.Response.StatusCode = 200;
             }
 
-            // Set DLNA headers with cache control
             context.Response.AddHeader("Accept-Ranges", "bytes");
             context.Response.AddHeader("Connection", "keep-alive");
             context.Response.AddHeader("transferMode.dlna.org", "Streaming");
             context.Response.AddHeader("Cache-Control", "no-cache, no-store, must-revalidate");
             context.Response.AddHeader("Pragma", "no-cache");
             context.Response.AddHeader("Expires", "0");
+            context.Response.AddHeader("X-Transcoding", "fMP4");
+            context.Response.AddHeader("X-Content-Type-Options", "nosniff");
 
-            if (streamInfo.IsDirectPlay)
-            {
-                var dlnaFeatures = "DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000";
-                context.Response.AddHeader("contentFeatures.dlna.org", dlnaFeatures);
-            }
-            else
-            {
-                context.Response.AddHeader("X-Transcoding", "true");
-                // For transcoded content, be more aggressive about no caching
-                context.Response.AddHeader("X-Content-Type-Options", "nosniff");
-            }
+            var dlnaFeatures = "DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000";
+            context.Response.AddHeader("contentFeatures.dlna.org", dlnaFeatures);
 
             sourceStream = await response.Content.ReadAsStreamAsync();
 
@@ -567,10 +476,10 @@ public class StreamingService
                 streamInfo,
                 context.Request.RemoteEndPoint,
                 sessionId,
-                rangeStart);
+                resumePositionTicks);
 
             var playedDuration = DateTime.UtcNow - startTime;
-            var estimatedPositionTicks = CalculateEndPosition(totalBytesStreamed, streamInfo, playedDuration, rangeStart);
+            var estimatedPositionTicks = CalculateEndPosition(totalBytesStreamed, streamInfo, playedDuration, resumePositionTicks);
 
             if (sessionId != null)
             {
@@ -579,20 +488,20 @@ public class StreamingService
 
                 await _playbackReportingService.StopPlaybackAsync(sessionId, estimatedPositionTicks, shouldMarkWatched);
 
-                _logger.LogInformation("Stream session {SessionId} completed - Streamed: {StreamedMB}MB, Duration: {Duration}, Position: {Position}ms, Marked watched: {Watched}",
+                _logger.LogInformation("fMP4 stream session {SessionId} completed - Streamed: {StreamedMB}MB, Duration: {Duration}, Position: {Position}ms, Marked watched: {Watched}",
                     sessionId, totalBytesStreamed / 1024.0 / 1024.0, playedDuration, TimeConversionUtil.TicksToMilliseconds(estimatedPositionTicks), shouldMarkWatched);
             }
 
-            _logger.LogInformation("Stream completed successfully for {Endpoint}", context.Request.RemoteEndPoint);
+            _logger.LogInformation("fMP4 stream completed successfully for {Endpoint}", context.Request.RemoteEndPoint);
         }
         catch (HttpRequestException httpEx)
         {
-            _logger.LogError(httpEx, "HTTP error during streaming");
+            _logger.LogError(httpEx, "HTTP error during fMP4 streaming");
 
             if (sessionId != null)
             {
                 var playedDuration = DateTime.UtcNow - startTime;
-                var estimatedPositionTicks = CalculateEndPosition(totalBytesStreamed, streamInfo, playedDuration, rangeStart);
+                var estimatedPositionTicks = CalculateEndPosition(totalBytesStreamed, streamInfo, playedDuration, resumePositionTicks);
                 await _playbackReportingService.StopPlaybackAsync(sessionId, estimatedPositionTicks, markAsWatched: false);
             }
 
@@ -600,49 +509,59 @@ public class StreamingService
         }
         catch (OperationCanceledException)
         {
-            _logger.LogInformation("Stream cancelled by client {Endpoint}", context.Request.RemoteEndPoint);
+            _logger.LogInformation("fMP4 stream cancelled by client {Endpoint}", context.Request.RemoteEndPoint);
 
             if (sessionId != null)
             {
                 var playedDuration = DateTime.UtcNow - startTime;
-                var estimatedPositionTicks = CalculateEndPosition(totalBytesStreamed, streamInfo, playedDuration, rangeStart);
+                var estimatedPositionTicks = CalculateEndPosition(totalBytesStreamed, streamInfo, playedDuration, resumePositionTicks);
                 await _playbackReportingService.StopPlaybackAsync(sessionId, estimatedPositionTicks, markAsWatched: false);
             }
         }
         catch (Exception ex) when (ex is IOException || ex is System.Net.HttpListenerException)
         {
             var playedDuration = DateTime.UtcNow - startTime;
-            var estimatedPositionTicks = CalculateEndPosition(totalBytesStreamed, streamInfo, playedDuration, rangeStart);
+            var estimatedPositionTicks = CalculateEndPosition(totalBytesStreamed, streamInfo, playedDuration, resumePositionTicks);
 
-            _logger.LogInformation("Stream interrupted after {TotalMB:F1} MB, duration: {Duration} - Client disconnected: {Error}",
-                totalBytesStreamed / 1024.0 / 1024.0, playedDuration, ex.Message);
+            // Determine if this was a normal client disconnect vs an error
+            var isNormalDisconnect = ex.Message.Contains("Broken pipe") || 
+                                   ex.Message.Contains("connection was closed") ||
+                                   ex.Message.Contains("transport connection");
+
+            if (isNormalDisconnect)
+            {
+                _logger.LogInformation("Client disconnected from fMP4 stream after {TotalMB:F1} MB, duration: {Duration}",
+                    totalBytesStreamed / 1024.0 / 1024.0, playedDuration);
+            }
+            else
+            {
+                _logger.LogWarning("fMP4 stream interrupted after {TotalMB:F1} MB, duration: {Duration} - {Error}",
+                    totalBytesStreamed / 1024.0 / 1024.0, playedDuration, ex.Message);
+            }
 
             if (sessionId != null)
             {
-                // Better pause detection logic for movies of any length
-                var hasSignificantProgress = totalBytesStreamed > 1024 * 1024; // 1MB minimum
+                var hasSignificantProgress = totalBytesStreamed > 1024 * 1024;
                 var notImmediateDisconnect = playedDuration.TotalSeconds > 5;
-                var notExtremelyLongStreaming = playedDuration.TotalHours < 6; // Allow up to 6 hours
+                var notExtremelyLongStreaming = playedDuration.TotalHours < 6;
 
-                // Calculate if we're likely in the middle of the movie vs at the end
                 var estimatedProgress = streamInfo.DurationTicks > 0 ?
                     (double)estimatedPositionTicks / streamInfo.DurationTicks : 0.0;
-                var likelyInMiddle = estimatedProgress < 0.9; // Less than 90% through
+                var likelyInMiddle = estimatedProgress < 0.9;
 
-                // Treat as pause if we have progress, not immediate disconnect, and likely in middle of content
                 var mightBePause = hasSignificantProgress && notImmediateDisconnect &&
-                                  notExtremelyLongStreaming && likelyInMiddle;
+                                  notExtremelyLongStreaming && likelyInMiddle && isNormalDisconnect;
 
                 if (mightBePause)
                 {
-                    _logger.LogInformation("PAUSE DETECTED: Session {SessionId} interrupted after {Duration} with {MB:F1}MB transferred at {Progress:F1}% progress, treating as pause",
-                        sessionId, playedDuration, totalBytesStreamed / 1024.0 / 1024.0, estimatedProgress * 100);
+                    _logger.LogInformation("PAUSE DETECTED: fMP4 session {SessionId} paused after {Duration} at {Progress:F1}% progress",
+                        sessionId, playedDuration, estimatedProgress * 100);
                     await _playbackReportingService.PausePlaybackAsync(sessionId, estimatedPositionTicks);
                 }
                 else
                 {
                     var shouldMarkWatched = TimeConversionUtil.IsNearEnd(estimatedPositionTicks, streamInfo.DurationTicks) && estimatedPositionTicks > 0;
-                    _logger.LogInformation("STREAM END: Session {SessionId} ended after {Duration}, position: {Position}ms, progress: {Progress:F1}%, marking watched: {Watched}",
+                    _logger.LogInformation("STREAM END: fMP4 session {SessionId} ended after {Duration}, position: {Position}ms, progress: {Progress:F1}%, marking watched: {Watched}",
                         sessionId, playedDuration, TimeConversionUtil.TicksToMilliseconds(estimatedPositionTicks), estimatedProgress * 100, shouldMarkWatched);
                     await _playbackReportingService.StopPlaybackAsync(sessionId, estimatedPositionTicks, markAsWatched: shouldMarkWatched);
                 }
@@ -650,7 +569,7 @@ public class StreamingService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error during streaming");
+            _logger.LogError(ex, "Error during fMP4 streaming");
 
             if (sessionId != null)
             {
@@ -679,7 +598,6 @@ public class StreamingService
     {
         try
         {
-            // Parse "bytes=1234-" or "bytes=1234-5678" format
             if (rangeHeader.StartsWith("bytes="))
             {
                 var rangeValue = rangeHeader.Substring(6);
@@ -698,7 +616,7 @@ public class StreamingService
     }
 
     // MARK: CopyStreamWithReportingAsync
-    private async Task<long> CopyStreamWithReportingAsync(Stream source, Stream destination, StreamInfo streamInfo, System.Net.IPEndPoint? clientEndpoint, string? sessionId, long? rangeStart = null)
+    private async Task<long> CopyStreamWithReportingAsync(Stream source, Stream destination, StreamInfo streamInfo, System.Net.IPEndPoint? clientEndpoint, string? sessionId, long? resumePositionTicks = null)
     {
         const int bufferSize = 81920;
         var buffer = new byte[bufferSize];
@@ -726,7 +644,7 @@ public class StreamingService
                     var elapsed = now - startTime;
                     var avgSpeed = totalBytes / elapsed.TotalSeconds / 1024 / 1024;
 
-                    _logger.LogDebug("Streaming progress: {TotalMB:F1} MB in {Elapsed:mm\\:ss}, avg speed: {Speed:F1} MB/s to {Client}",
+                    _logger.LogDebug("fMP4 streaming progress: {TotalMB:F1} MB in {Elapsed:mm\\:ss}, avg speed: {Speed:F1} MB/s to {Client}",
                         totalBytes / 1024.0 / 1024.0, elapsed, avgSpeed, clientEndpoint);
 
                     lastLogTime = now;
@@ -734,106 +652,90 @@ public class StreamingService
 
                 if (sessionId != null && (now - lastProgressReport).TotalSeconds >= 30)
                 {
-                    var playedDuration = now - startTime;
-                    var estimatedPositionTicks = CalculateCurrentPosition(totalBytes, streamInfo, playedDuration, rangeStart);
+                    // Check if session still exists before reporting progress
+                    var activeSessions = await _playbackReportingService.GetActiveSessionsAsync();
+                    if (activeSessions.ContainsKey(sessionId))
+                    {
+                        var playedDuration = now - startTime;
+                        var estimatedPositionTicks = CalculateCurrentPosition(totalBytes, streamInfo, playedDuration, resumePositionTicks);
 
-                    await _playbackReportingService.UpdatePlaybackProgressAsync(sessionId, estimatedPositionTicks, isPaused: false);
-                    lastProgressReport = now;
+                        await _playbackReportingService.UpdatePlaybackProgressAsync(sessionId, estimatedPositionTicks, isPaused: false);
+                        lastProgressReport = now;
+                    }
                 }
             }
 
             var finalElapsed = DateTime.UtcNow - startTime;
             var finalAvgSpeed = totalBytes / finalElapsed.TotalSeconds / 1024 / 1024;
 
-            _logger.LogInformation("Stream completed: {TotalMB:F1} MB in {Elapsed:mm\\:ss}, avg speed: {Speed:F1} MB/s, transcoded: {Transcoded}",
-                totalBytes / 1024.0 / 1024.0, finalElapsed, finalAvgSpeed, !streamInfo.IsDirectPlay);
+            _logger.LogInformation("fMP4 stream completed: {TotalMB:F1} MB in {Elapsed:mm\\:ss}, avg speed: {Speed:F1} MB/s",
+                totalBytes / 1024.0 / 1024.0, finalElapsed, finalAvgSpeed);
 
             return totalBytes;
         }
         catch (Exception ex) when (ex is IOException || ex is ObjectDisposedException)
         {
-            _logger.LogInformation("Stream interrupted after {TotalMB:F1} MB (client disconnected)", totalBytes / 1024.0 / 1024.0);
+            _logger.LogInformation("fMP4 stream interrupted after {TotalMB:F1} MB (client disconnected)", totalBytes / 1024.0 / 1024.0);
             throw;
         }
     }
 
     // MARK: CalculateCurrentPosition
-    private long CalculateCurrentPosition(long bytesStreamed, StreamInfo streamInfo, TimeSpan playedDuration, long? rangeStart = null)
+    private long CalculateCurrentPosition(long bytesStreamed, StreamInfo streamInfo, TimeSpan playedDuration, long? resumePositionTicks = null)
     {
-        // If we have a range start (seeking), use that as base position
-        if (rangeStart.HasValue && streamInfo.Size > 0 && streamInfo.DurationTicks > 0)
+        if (resumePositionTicks.HasValue)
         {
-            var basePositionRatio = (double)rangeStart.Value / streamInfo.Size;
-            var basePositionTicks = (long)(streamInfo.DurationTicks * basePositionRatio);
-
-            // For seeks, don't add time-based progress - return the seek position
-            return Math.Min(basePositionTicks, streamInfo.DurationTicks);
+            var resumeBaseTicks = resumePositionTicks.Value;
+            var additionalPlayedTicks = (long)(playedDuration.Ticks * 0.9);
+            var currentPositionTicks = resumeBaseTicks + additionalPlayedTicks;
+            
+            var result = Math.Min(currentPositionTicks, streamInfo.DurationTicks);
+            
+            _logger.LogDebug("RESUME POSITION CALC: Resume base: {ResumeMs}ms, Additional played: {AdditionalMs}ms, Current: {CurrentMs}ms",
+                TimeConversionUtil.TicksToMilliseconds(resumeBaseTicks),
+                TimeConversionUtil.TicksToMilliseconds(additionalPlayedTicks),
+                TimeConversionUtil.TicksToMilliseconds(result));
+            
+            return result;
         }
 
-        // For transcoded content with unknown size, be conservative with time estimation
-        if (!streamInfo.IsDirectPlay || streamInfo.Size <= 0)
-        {
-            // Use a more conservative time-based calculation for transcoded content
-            // Account for the fact that transcoded streams might buffer/pause
-            var conservativeProgress = (long)(playedDuration.Ticks * 0.8); // 80% of played time
-            return Math.Min(conservativeProgress, streamInfo.DurationTicks);
-        }
-
-        // For direct play with known size, use byte-based calculation
-        if (streamInfo.Size > 0 && streamInfo.DurationTicks > 0)
-        {
-            var progressRatio = (double)bytesStreamed / streamInfo.Size;
-            var estimatedPositionTicks = (long)(streamInfo.DurationTicks * progressRatio);
-            return Math.Min(estimatedPositionTicks, streamInfo.DurationTicks);
-        }
-
-        return Math.Min(playedDuration.Ticks, streamInfo.DurationTicks);
+        var conservativeProgress = (long)(playedDuration.Ticks * 0.8);
+        return Math.Min(conservativeProgress, streamInfo.DurationTicks);
     }
 
     // MARK: CalculateEndPosition
-    private long CalculateEndPosition(long totalBytesStreamed, StreamInfo streamInfo, TimeSpan totalPlayedDuration, long? rangeStart = null)
+    private long CalculateEndPosition(long totalBytesStreamed, StreamInfo streamInfo, TimeSpan totalPlayedDuration, long? resumePositionTicks = null)
     {
-        // If we have a range start (seeking), calculate from there
-        if (rangeStart.HasValue && streamInfo.Size > 0 && streamInfo.DurationTicks > 0)
+        if (resumePositionTicks.HasValue)
         {
-            var basePositionRatio = (double)rangeStart.Value / streamInfo.Size;
-            var basePositionTicks = (long)(streamInfo.DurationTicks * basePositionRatio);
-
-            // For seeks that end quickly, just return the seek position
+            var resumeBaseTicks = resumePositionTicks.Value;
+            
             if (totalPlayedDuration.TotalSeconds < 30)
             {
-                return Math.Min(basePositionTicks, streamInfo.DurationTicks);
+                _logger.LogDebug("RESUME END CALC: Short duration ({Duration}s), returning resume position {ResumeMs}ms",
+                    totalPlayedDuration.TotalSeconds, TimeConversionUtil.TicksToMilliseconds(resumeBaseTicks));
+                return Math.Min(resumeBaseTicks, streamInfo.DurationTicks);
             }
 
-            // For longer streams after seek, add conservative time progress
             var additionalTicks = (long)(totalPlayedDuration.Ticks * 0.7);
-            return Math.Min(basePositionTicks + additionalTicks, streamInfo.DurationTicks);
+            var endPositionTicks = resumeBaseTicks + additionalTicks;
+            var result = Math.Min(endPositionTicks, streamInfo.DurationTicks);
+            
+            _logger.LogDebug("RESUME END CALC: Resume base: {ResumeMs}ms, Additional: {AdditionalMs}ms, End: {EndMs}ms",
+                TimeConversionUtil.TicksToMilliseconds(resumeBaseTicks),
+                TimeConversionUtil.TicksToMilliseconds(additionalTicks),
+                TimeConversionUtil.TicksToMilliseconds(result));
+            
+            return result;
         }
 
-        // For transcoded content, be much more conservative
-        if (!streamInfo.IsDirectPlay || streamInfo.Size <= 0)
+        if (totalPlayedDuration.TotalSeconds < 10)
         {
-            if (totalPlayedDuration.TotalSeconds < 10)
-            {
-                return 0; // Very short duration suggests immediate disconnect
-            }
-
-            // Use conservative time-based calculation for transcoded content
-            var conservativePosition = (long)(totalPlayedDuration.Ticks * 0.6); // 60% of played time
-            return Math.Min(conservativePosition, streamInfo.DurationTicks);
+            return 0;
         }
 
-        // For direct play with known size, use byte-based calculation
-        if (streamInfo.Size > 0 && streamInfo.DurationTicks > 0 && totalBytesStreamed > 0)
-        {
-            var progressRatio = (double)totalBytesStreamed / streamInfo.Size;
-            var estimatedPositionTicks = (long)(streamInfo.DurationTicks * progressRatio);
-            return Math.Min(estimatedPositionTicks, streamInfo.DurationTicks);
-        }
-
-        // Fallback to conservative time-based
-        var fallbackPosition = (long)(totalPlayedDuration.Ticks * 0.7);
-        return Math.Min(fallbackPosition, streamInfo.DurationTicks);
+        var conservativePosition = (long)(totalPlayedDuration.Ticks * 0.6);
+        return Math.Min(conservativePosition, streamInfo.DurationTicks);
     }
 
     // MARK: SendErrorResponse
@@ -867,31 +769,6 @@ public class StreamingService
             Jellyfin.Sdk.Generated.Models.BaseItemDto_Type.Audio => "Audio",
             Jellyfin.Sdk.Generated.Models.BaseItemDto_Type.Photo => "Photo",
             _ => "Video"
-        };
-    }
-
-    // MARK: GetMimeTypeFromContainer
-    private string GetMimeTypeFromContainer(string? container)
-    {
-        return container?.ToLowerInvariant() switch
-        {
-            "mp4" => "video/mp4",
-            "mkv" => "video/x-matroska",
-            "avi" => "video/x-msvideo",
-            "mov" => "video/quicktime",
-            "wmv" => "video/x-ms-wmv",
-            "webm" => "video/webm",
-            "mp3" => "audio/mpeg",
-            "flac" => "audio/flac",
-            "aac" => "audio/aac",
-            "wav" => "audio/wav",
-            "ogg" => "audio/ogg",
-            "m4a" => "audio/mp4",
-            "jpg" or "jpeg" => "image/jpeg",
-            "png" => "image/png",
-            "gif" => "image/gif",
-            "bmp" => "image/bmp",
-            _ => "application/octet-stream"
         };
     }
 }

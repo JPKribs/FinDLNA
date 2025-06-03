@@ -128,7 +128,7 @@ public class PlaybackReportingService
         {
             if (!_activeSessions.TryGetValue(sessionId, out var session))
             {
-                _logger.LogWarning("Session {SessionId} not found for progress update", sessionId);
+                _logger.LogDebug("Session {SessionId} not found for progress update (may have been stopped)", sessionId);
                 return;
             }
 

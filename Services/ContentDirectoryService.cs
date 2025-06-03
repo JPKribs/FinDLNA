@@ -6,6 +6,7 @@ using Microsoft.Extensions.Configuration;
 using FinDLNA.Models;
 using FinDLNA.Services;
 using Jellyfin.Sdk.Generated.Models;
+using FinDLNA.Utilities;
 
 namespace FinDLNA.Services;
 
@@ -47,16 +48,6 @@ public class ContentDirectoryService
         BaseItemDto_Type.Video,
         BaseItemDto_Type.MusicVideo,
         BaseItemDto_Type.AudioBook
-    };
-
-    private static readonly HashSet<string> UnsupportedSubtitleCodecs = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "pgs", "pgssub", "dvdsub", "dvbsub", "hdmv_pgs_subtitle", "presentation_graphics_stream"
-    };
-
-    private static readonly HashSet<string> SupportedSubtitleCodecs = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "srt", "subrip", "ass", "ssa", "vtt", "webvtt", "sub", "idx"
     };
 
     public ContentDirectoryService(
@@ -377,156 +368,25 @@ public class ContentDirectoryService
         var bitrate = mediaSource?.Bitrate;
         var bitrateAttr = bitrate.HasValue ? $" bitrate=\"{bitrate.Value}\"" : "";
         
-        var captionInfo = GetCaptionInfoXml(item);
-        var subtitleResources = GetSubtitleResources(item);
+        // Add size estimate for fMP4 streams to help with duration calculation
+        var estimatedSize = EstimateTranscodedSize(runTimeTicks, bitrate);
+        var sizeAttr = estimatedSize > 0 ? $" size=\"{estimatedSize}\"" : "";
         
-        _logger.LogInformation("Creating media item XML: {Title} (Duration: {Duration}, Size: {Size}, Bitrate: {Bitrate}, Subtitles: {SubtitleCount})", 
-            title, duration, size, bitrate, subtitleResources.Count);
+        _logger.LogInformation("Creating fMP4 media item XML: {Title} (Duration: {Duration}, Original Size: {Size}, Estimated Size: {EstimatedSize}, Bitrate: {Bitrate})", 
+            title, duration, size, estimatedSize, bitrate);
         
-        var mainResource = $"<res protocolInfo=\"http-get:*:{mimeType}:*\" size=\"{size}\"{durationAttr}{resolutionAttr}{bitrateAttr}>{streamUrl}</res>";
+        var dlnaFlags = "DLNA.ORG_PN=AVC_MP4_MP_HD_1080i_AAC;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000";
+        var mainResource = $"<res protocolInfo=\"http-get:*:{mimeType}:{dlnaFlags}\"{sizeAttr}{durationAttr}{resolutionAttr}{bitrateAttr}>{streamUrl}</res>";
         
         return $"""
             <item id="{item.Id.Value}" parentID="{parentId}" restricted="1">
                 <dc:title>{title}</dc:title>
+                <dc:date>{DateTime.UtcNow:yyyy-MM-dd}</dc:date>
                 <upnp:class>{upnpClass}</upnp:class>
                 {albumArtXml}
-                {captionInfo}
                 {mainResource}
-                {string.Join("\n            ", subtitleResources)}
             </item>
             """;
-    }
-
-    // MARK: GetCaptionInfoXml
-    private string GetCaptionInfoXml(BaseItemDto item)
-    {
-        if (!item.Id.HasValue || item.MediaSources == null)
-            return "";
-
-        var captionInfos = new List<string>();
-
-        foreach (var mediaSource in item.MediaSources)
-        {
-            if (mediaSource.MediaStreams == null) continue;
-
-            var supportedSubtitleStreams = mediaSource.MediaStreams
-                .Where(s => s.Type == MediaStream_Type.Subtitle && IsSubtitleSupported(s.Codec))
-                .ToList();
-
-            foreach (var subtitleStream in supportedSubtitleStreams)
-            {
-                if (subtitleStream.Index == null) continue;
-
-                var language = subtitleStream.Language ?? subtitleStream.Language ?? "en";
-                var localIp = GetLocalIPAddress();
-                var dlnaPort = _configuration["Dlna:Port"] ?? "8200";
-                var subtitleUrl = $"http://{localIp}:{dlnaPort}/subtitle/{item.Id.Value}/{subtitleStream.Index.Value}";
-
-                captionInfos.Add($"<sec:CaptionInfo sec:type=\"srt\">{subtitleUrl}</sec:CaptionInfo>");
-                captionInfos.Add($"<sec:CaptionInfoEx sec:type=\"srt\">{language}:{subtitleUrl}</sec:CaptionInfoEx>");
-            }
-        }
-
-        return string.Join("\n            ", captionInfos);
-    }
-
-    // MARK: GetSubtitleResources
-    private List<string> GetSubtitleResources(BaseItemDto item)
-    {
-        var subtitleResources = new List<string>();
-        
-        if (!item.Id.HasValue || item.MediaSources == null)
-            return subtitleResources;
-
-        _logger.LogDebug("Processing subtitles for item {ItemId}", item.Id.Value);
-
-        foreach (var mediaSource in item.MediaSources)
-        {
-            if (mediaSource.MediaStreams == null) continue;
-
-            _logger.LogDebug("MediaSource (Container: {Container}) has {StreamCount} streams", 
-                mediaSource.Container, mediaSource.MediaStreams.Count);
-
-            var subtitleStreams = mediaSource.MediaStreams
-                .Where(s => s.Type == MediaStream_Type.Subtitle)
-                .ToList();
-
-            _logger.LogDebug("Found {SubtitleCount} subtitle streams for item {ItemId}", subtitleStreams.Count, item.Id.Value);
-
-            foreach (var subtitleStream in subtitleStreams)
-            {
-                _logger.LogDebug("Evaluating subtitle stream: Index={Index}, Language={Language}, Codec={Codec}, IsExternal={IsExternal}, DisplayTitle={DisplayTitle}", 
-                    subtitleStream.Index, 
-                    subtitleStream.Language, 
-                    subtitleStream.Codec,
-                    subtitleStream.IsExternal,
-                    subtitleStream.DisplayTitle);
-
-                if (subtitleStream.Index == null) 
-                {
-                    _logger.LogWarning("Subtitle stream has null index, skipping");
-                    continue;
-                }
-
-                if (!IsSubtitleSupported(subtitleStream.Codec))
-                {
-                    _logger.LogInformation("Skipping unsupported subtitle codec: {Codec} for item {ItemId}", 
-                        subtitleStream.Codec, item.Id.Value);
-                    continue;
-                }
-
-                var language = subtitleStream.Language ?? subtitleStream.Language ?? subtitleStream.DisplayTitle ?? "unknown";
-                
-                var localIp = GetLocalIPAddress();
-                var dlnaPort = _configuration["Dlna:Port"] ?? "8200";
-                var subtitleUrl = $"http://{localIp}:{dlnaPort}/subtitle/{item.Id.Value}/{subtitleStream.Index.Value}";
-                
-                var protocolInfo = "http-get:*:text/srt:*";
-                
-                if (!string.IsNullOrEmpty(language) && language != "unknown")
-                {
-                    var resourceXml = $"<res protocolInfo=\"{protocolInfo}\" dlna:subtitle=\"{language}\">{subtitleUrl}</res>";
-                    subtitleResources.Add(resourceXml);
-                }
-                else
-                {
-                    var resourceXml = $"<res protocolInfo=\"{protocolInfo}\">{subtitleUrl}</res>";
-                    subtitleResources.Add(resourceXml);
-                }
-                
-                _logger.LogInformation("Added supported subtitle resource for item {ItemId}: {Language} ({Codec}) at {Url}, Stream Index: {StreamIndex}", 
-                    item.Id.Value, language, subtitleStream.Codec, subtitleUrl, subtitleStream.Index.Value);
-            }
-        }
-
-        return subtitleResources;
-    }
-
-    // MARK: IsSubtitleSupported
-    private bool IsSubtitleSupported(string? codec)
-    {
-        if (string.IsNullOrEmpty(codec))
-        {
-            _logger.LogDebug("Subtitle stream has no codec information, treating as unsupported");
-            return false;
-        }
-
-        var normalizedCodec = codec.ToLowerInvariant();
-
-        if (UnsupportedSubtitleCodecs.Contains(normalizedCodec))
-        {
-            _logger.LogDebug("Subtitle codec {Codec} is explicitly unsupported", codec);
-            return false;
-        }
-
-        if (SupportedSubtitleCodecs.Contains(normalizedCodec))
-        {
-            _logger.LogDebug("Subtitle codec {Codec} is explicitly supported", codec);
-            return true;
-        }
-
-        _logger.LogDebug("Unknown subtitle codec {Codec}, treating as supported for conversion attempt", codec);
-        return true;
     }
 
     // MARK: GetProxyStreamUrl
@@ -534,7 +394,10 @@ public class ContentDirectoryService
     {
         var localIp = GetLocalIPAddress();
         var dlnaPort = _configuration["Dlna:Port"] ?? "8200";
-        return $"http://{localIp}:{dlnaPort}/stream/{itemId}";
+        var streamUrl = $"http://{localIp}:{dlnaPort}/stream/{itemId}";
+        
+        _logger.LogDebug("Generated proxy stream URL for item {ItemId}: {StreamUrl}", itemId, streamUrl);
+        return streamUrl;
     }
 
     // MARK: GetLocalIPAddress
@@ -547,13 +410,17 @@ public class ContentDirectoryService
             {
                 if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !System.Net.IPAddress.IsLoopback(ip))
                 {
+                    _logger.LogDebug("Using local IP address: {IpAddress}", ip.ToString());
                     return ip.ToString();
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
+            _logger.LogWarning(ex, "Failed to get local IP address, using loopback");
         }
+        
+        _logger.LogWarning("No non-loopback IP found, using 127.0.0.1");
         return "127.0.0.1";
     }
 
@@ -594,14 +461,34 @@ public class ContentDirectoryService
         return "";
     }
 
+    // MARK: EstimateTranscodedSize
+    private long EstimateTranscodedSize(long? runTimeTicks, int? bitrate)
+    {
+        if (!runTimeTicks.HasValue || runTimeTicks.Value <= 0)
+            return 0;
+
+        // Use original bitrate if available, otherwise estimate
+        var estimatedBitrate = bitrate ?? 8000000; // 8 Mbps default for HD content
+        
+        // For fMP4 transcoding, use a conservative estimate (slightly lower than target bitrate)
+        var transcodeBitrate = Math.Min(estimatedBitrate, 8000000); // Cap at 8 Mbps
+        
+        var durationSeconds = TimeConversionUtil.TicksToSeconds(runTimeTicks.Value);
+        var estimatedBytes = (long)(durationSeconds * transcodeBitrate / 8); // Convert bits to bytes
+        
+        _logger.LogDebug("Estimated transcoded size: {EstimatedMB}MB for {DurationMinutes}min at {BitrateMbps}Mbps", 
+            estimatedBytes / 1024.0 / 1024.0, durationSeconds / 60.0, transcodeBitrate / 1024.0 / 1024.0);
+        
+        return estimatedBytes;
+    }
+
     // MARK: CreateDidlXml
     private string CreateDidlXml(string content)
     {
         return $"""
             <DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" 
                        xmlns:dc="http://purl.org/dc/elements/1.1/" 
-                       xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"
-                       xmlns:sec="http://www.sec.co.kr/">
+                       xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
                 {content}
             </DIDL-Lite>
             """;
@@ -631,28 +518,7 @@ public class ContentDirectoryService
     // MARK: GetMimeTypeFromItem
     private string GetMimeTypeFromItem(BaseItemDto item)
     {
-        var mediaSource = item.MediaSources?.FirstOrDefault();
-        var container = mediaSource?.Container?.ToLowerInvariant();
-
-        return container switch
-        {
-            "mp4" => "video/mp4",
-            "mkv" => "video/x-matroska",
-            "avi" => "video/x-msvideo",
-            "mov" => "video/quicktime",
-            "wmv" => "video/x-ms-wmv",
-            "webm" => "video/webm",
-            "mp3" => "audio/mpeg",
-            "flac" => "audio/flac",
-            "aac" => "audio/aac",
-            "wav" => "audio/wav",
-            "ogg" => "audio/ogg",
-            "m4a" => "audio/mp4",
-            "jpg" or "jpeg" => "image/jpeg",
-            "png" => "image/png",
-            "gif" => "image/gif",
-            _ => "application/octet-stream"
-        };
+        return "video/mp4";
     }
 
     // MARK: FormatDuration
@@ -668,6 +534,7 @@ public class ContentDirectoryService
         var seconds = timeSpan.Seconds;
         var milliseconds = timeSpan.Milliseconds;
 
+        // Use standard format that most DLNA clients expect
         var formattedDuration = $"{hours}:{minutes:00}:{seconds:00}.{milliseconds:000}";
 
         _logger.LogDebug("Formatted duration for DLNA: {RunTimeTicks} ticks ({TotalSeconds}s) -> {FormattedDuration}",
@@ -692,7 +559,13 @@ public class ContentDirectoryService
     private string CreateBrowseResponse(string result, int numberReturned, int totalMatches)
     {
         var escapedResult = System.Security.SecurityElement.Escape(result);
-        return _xmlTemplateService.GetTemplate("BrowseResponse", escapedResult, numberReturned, totalMatches);
+        var response = _xmlTemplateService.GetTemplate("BrowseResponse", escapedResult, numberReturned, totalMatches);
+        
+        _logger.LogDebug("Created browse response with {NumberReturned} items, {TotalMatches} total", 
+            numberReturned, totalMatches);
+        _logger.LogTrace("Browse response XML: {Response}", response);
+        
+        return response;
     }
 
     // MARK: CreateSoapFault
