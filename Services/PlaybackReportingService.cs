@@ -17,6 +17,7 @@ public class PlaybackReportingService
     private readonly HttpClient _httpClient;
     private readonly ConcurrentDictionary<string, PlaybackSession> _activeSessions = new();
     private readonly ConcurrentDictionary<string, object> _sessionLocks = new();
+    private readonly ConcurrentDictionary<string, byte> _stoppingSessions = new();
     private readonly object _globalLock = new object();
 
     public PlaybackReportingService(
@@ -147,28 +148,46 @@ public class PlaybackReportingService
         }
 
         var sessionLock = GetSessionLock(sessionId);
+        
+        // MARK: Create a copy of the session data for the update
+        string userId;
+        Guid itemId;
+        long actualPosition;
+        
         lock (sessionLock)
         {
-            // MARK: Double-check session still exists after acquiring lock
             if (!_activeSessions.TryGetValue(sessionId, out session))
             {
                 _logger.LogDebug("Session {SessionId} was removed during progress update", sessionId);
                 return;
             }
 
-            // MARK: Update session state
-            session.LastProgressUpdate = DateTimeOffset.UtcNow;
-            session.LastPositionTicks = positionTicks;
-            session.IsPaused = isPaused;
-
-            if (isPaused)
+            // MARK: Validate position is reasonable
+            var timeSinceLastUpdate = DateTimeOffset.UtcNow - session.LastProgressUpdate;
+            var maxReasonableAdvance = TimeConversionUtil.SecondsToTicks(timeSinceLastUpdate.TotalSeconds * 2); // 2x playback speed max
+            
+            if (positionTicks > session.LastPositionTicks + maxReasonableAdvance)
             {
-                session.PauseTime = DateTimeOffset.UtcNow;
+                _logger.LogWarning("Position jump too large: {Current}ms -> {New}ms (max allowed: {Max}ms)",
+                    TimeConversionUtil.TicksToMilliseconds(session.LastPositionTicks),
+                    TimeConversionUtil.TicksToMilliseconds(positionTicks),
+                    TimeConversionUtil.TicksToMilliseconds(session.LastPositionTicks + maxReasonableAdvance));
+                
+                // MARK: Cap the position to a reasonable advance
+                actualPosition = session.LastPositionTicks + maxReasonableAdvance;
             }
             else
             {
-                session.PauseTime = null;
+                actualPosition = positionTicks;
             }
+
+            session.LastProgressUpdate = DateTimeOffset.UtcNow;
+            session.LastPositionTicks = actualPosition;
+            session.IsPaused = isPaused;
+            session.PauseTime = isPaused ? DateTimeOffset.UtcNow : null;
+
+            userId = session.UserId;
+            itemId = session.ItemId;
         }
 
         try
@@ -184,19 +203,19 @@ public class PlaybackReportingService
 
             var progressInfo = new
             {
-                UserId = session.UserId,
-                ItemId = session.ItemId,
-                SessionId = session.SessionId,
-                MediaSourceId = session.ItemId.ToString(),
-                PositionTicks = positionTicks,
+                UserId = userId,
+                ItemId = itemId,
+                SessionId = sessionId,
+                MediaSourceId = itemId.ToString(),
+                PositionTicks = actualPosition,
                 IsPaused = isPaused,
                 IsMuted = false,
                 VolumeLevel = 100,
                 CanSeek = true,
                 RepeatMode = "RepeatNone",
                 PlayMethod = "DirectPlay",
-                PlaySessionId = session.SessionId,
-                PlaylistItemId = session.SessionId,
+                PlaySessionId = sessionId,
+                PlaylistItemId = sessionId,
                 EventName = isPaused ? "pause" : "timeupdate",
                 LiveStreamId = (string?)null
             };
@@ -208,14 +227,15 @@ public class PlaybackReportingService
             var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
             request.Headers.Add("X-Emby-Token", accessToken);
 
-            _logger.LogDebug("PROGRESS UPDATE: {Json}", json);
+            _logger.LogDebug("PROGRESS UPDATE: Position={Position}ms, IsPaused={IsPaused}", 
+                TimeConversionUtil.TicksToMilliseconds(actualPosition), isPaused);
 
             var response = await _httpClient.SendAsync(request);
 
             if (response.IsSuccessStatusCode)
             {
                 _logger.LogDebug("PROGRESS UPDATED: Session {SessionId} at {Position}ms, paused: {IsPaused}", 
-                    sessionId, TimeConversionUtil.TicksToMilliseconds(positionTicks), isPaused);
+                    sessionId, TimeConversionUtil.TicksToMilliseconds(actualPosition), isPaused);
             }
             else
             {
@@ -251,21 +271,26 @@ public class PlaybackReportingService
     // MARK: StopPlaybackAsync
     public async Task StopPlaybackAsync(string sessionId, long? finalPositionTicks = null, bool markAsWatched = false)
     {
-        var sessionLock = GetSessionLock(sessionId);
-        PlaybackSession? session = null;
-
-        lock (sessionLock)
+        // MARK: Use a concurrent dictionary to track sessions being stopped
+        if (!_stoppingSessions.TryAdd(sessionId, byte.MinValue))
         {
-            // MARK: Check if session exists and remove it atomically
-            if (!_activeSessions.TryRemove(sessionId, out session))
-            {
-                _logger.LogDebug("Session {SessionId} not found or already removed for stop", sessionId);
-                return;
-            }
+            _logger.LogDebug("Session {SessionId} is already being stopped", sessionId);
+            return;
         }
 
         try
         {
+            var sessionLock = GetSessionLock(sessionId);
+            PlaybackSession? session = null;
+
+            lock (sessionLock)
+            {
+                if (!_activeSessions.TryRemove(sessionId, out session))
+                {
+                    _logger.LogDebug("Session {SessionId} not found or already removed for stop", sessionId);
+                    return;
+                }
+            }
             if (!IsConfigured)
             {
                 _logger.LogWarning("Jellyfin not configured for stop playback");
@@ -327,7 +352,8 @@ public class PlaybackReportingService
         }
         finally
         {
-            // MARK: Clean up session lock
+            _stoppingSessions.TryRemove(sessionId, out _);
+            
             lock (_globalLock)
             {
                 _sessionLocks.TryRemove(sessionId, out _);

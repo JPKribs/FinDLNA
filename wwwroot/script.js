@@ -71,19 +71,9 @@ document.addEventListener('DOMContentLoaded', function() {
             <h1>FinDLNA Server</h1>
             <div class="info-box">
                 <h3>Current Configuration</h3>
-
-                <br>
-
                 <div style="display: flex; justify-content: space-between;">
                 <strong>Server:</strong>
                 <span>${serverUrl}</span>
-                </div>
-
-                <br>
-
-                <div style="display: flex; justify-content: space-between;">
-                <strong>Status:</strong>
-                <span>Running</span>
                 </div>
             </div>
             <div class="button-group">

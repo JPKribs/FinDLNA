@@ -206,29 +206,23 @@ public class StreamingService
         {
             lock (_sessionLock)
             {
-                // MARK: Only proceed if we successfully remove the session mapping
-                if (_itemToSessionMap.TryRemove(itemId, out var mappedSessionId) && mappedSessionId == sessionId)
+                if (_itemToSessionMap.TryGetValue(itemId, out var mappedSessionId) && mappedSessionId == sessionId)
                 {
+                    _itemToSessionMap.TryRemove(itemId, out _);
                     shouldStop = true;
-                    
-                    if (_streamProgress.TryGetValue(sessionId, out var progress))
-                    {
-                        finalPosition ??= progress.CurrentTicks;
-                    }
-                    
+                }
+                
+                if (_streamProgress.TryGetValue(sessionId, out var progress))
+                {
+                    finalPosition ??= progress.CurrentTicks;
                     _streamProgress.TryRemove(sessionId, out _);
                 }
             }
 
-            // MARK: Only stop playback if we were the ones to remove the mapping
             if (shouldStop)
             {
                 await _playbackReportingService.StopPlaybackAsync(sessionId, finalPosition, markAsWatched);
                 _logger.LogInformation("SESSION CLEANUP: Cleaned up session {SessionId} for item {ItemId}", sessionId, itemId);
-            }
-            else
-            {
-                _logger.LogDebug("SESSION CLEANUP: Session {SessionId} already cleaned up", sessionId);
             }
         }
         catch (Exception ex)
