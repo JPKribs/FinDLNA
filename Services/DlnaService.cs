@@ -3,6 +3,7 @@ using System.Text;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using FinDLNA.Services;
+using Jellyfin.Sdk.Generated.Models;
 
 namespace FinDLNA.Services;
 
@@ -95,7 +96,7 @@ public class DlnaService : IDisposable
         }
     }
 
-    // MARK: HandleRequest
+// MARK: HandleRequest
     private async Task HandleRequest(HttpListenerContext context)
     {
         var request = context.Request;
@@ -137,6 +138,20 @@ public class DlnaService : IDisposable
                     await HandleEventSubscription(request, response);
                     break;
 
+                case var p when p.StartsWith("/subtitle/"):
+                    var pathParts = path.Split('/');
+                    if (pathParts.Length >= 4 && Guid.TryParse(pathParts[2], out var subItemId) && int.TryParse(pathParts[3], out var streamIndex))
+                    {
+                        await HandleSubtitleRequest(context, subItemId, streamIndex);
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Invalid subtitle path: {Path}", path);
+                        response.StatusCode = 400;
+                        response.Close();
+                    }
+                    break;
+
                 default:
                     if (path.StartsWith("/stream/"))
                     {
@@ -166,6 +181,144 @@ public class DlnaService : IDisposable
                 _logger.LogDebug(closeEx, "Error closing response after exception");
             }
         }
+    }
+
+    // MARK: HandleSubtitleRequest
+    private async Task HandleSubtitleRequest(HttpListenerContext context, Guid itemId, int streamIndex)
+    {
+        try
+        {
+            _logger.LogInformation("SUBTITLE REQUEST: item {ItemId}, stream {StreamIndex} from {UserAgent}", 
+                itemId, streamIndex, context.Request.UserAgent);
+
+            // Get the item to check what subtitle streams are actually available
+            var item = await _jellyfinService.GetItemAsync(itemId);
+            if (item == null)
+            {
+                _logger.LogWarning("Item {ItemId} not found for subtitle request", itemId);
+                context.Response.StatusCode = 404;
+                context.Response.Close();
+                return;
+            }
+
+            // Log all available subtitle streams
+            var mediaSource = item.MediaSources?.FirstOrDefault();
+            if (mediaSource?.MediaStreams != null)
+            {
+                var subtitleStreams = mediaSource.MediaStreams
+                    .Where(s => s.Type == MediaStream_Type.Subtitle)
+                    .ToList();
+
+                _logger.LogInformation("Available subtitle streams for item {ItemId} (Container: {Container}):", itemId, mediaSource.Container);
+                foreach (var stream in subtitleStreams)
+                {
+                    _logger.LogInformation("  Stream Index: {Index}, Language: {Language}, Codec: {Codec}, IsExternal: {IsExternal}", 
+                        stream.Index, stream.Language, stream.Codec, stream.IsExternal);
+                }
+
+                // Find the subtitle stream with the matching index
+                var requestedStream = subtitleStreams.FirstOrDefault(s => s.Index == streamIndex);
+                if (requestedStream == null)
+                {
+                    _logger.LogWarning("Requested subtitle stream index {StreamIndex} not found for item {ItemId}", streamIndex, itemId);
+                    context.Response.StatusCode = 404;
+                    context.Response.Close();
+                    return;
+                }
+
+                _logger.LogInformation("Processing subtitle stream: Index={Index}, Language={Language}, Codec={Codec}", 
+                    requestedStream.Index, requestedStream.Language, requestedStream.Codec);
+            }
+
+            // For embedded subtitles (especially MKV), try multiple URL patterns
+            var subtitleUrls = new[]
+            {
+                // Pattern 1: /Videos/{id}/{streamIndex}/Subtitles.srt
+                $"{_configuration["Jellyfin:ServerUrl"]?.TrimEnd('/')}/Videos/{itemId}/{streamIndex}/Subtitles.srt?X-Emby-Token={_configuration["Jellyfin:AccessToken"]}",
+                
+                // Pattern 2: /Videos/{id}/Subtitles/{streamIndex}/Stream.srt
+                $"{_configuration["Jellyfin:ServerUrl"]?.TrimEnd('/')}/Videos/{itemId}/Subtitles/{streamIndex}/Stream.srt?X-Emby-Token={_configuration["Jellyfin:AccessToken"]}",
+                
+                // Pattern 3: /Videos/{id}/Subtitles/{streamIndex}
+                $"{_configuration["Jellyfin:ServerUrl"]?.TrimEnd('/')}/Videos/{itemId}/Subtitles/{streamIndex}?format=srt&X-Emby-Token={_configuration["Jellyfin:AccessToken"]}",
+                
+                // Pattern 4: Stream endpoint
+                $"{_configuration["Jellyfin:ServerUrl"]?.TrimEnd('/')}/Videos/{itemId}/stream?StreamIndex={streamIndex}&api_key={_configuration["Jellyfin:AccessToken"]}"
+            };
+
+            foreach (var subtitleUrl in subtitleUrls)
+            {
+                _logger.LogDebug("Trying subtitle URL: {SubtitleUrl}", subtitleUrl);
+
+                using var httpClient = new HttpClient();
+                httpClient.Timeout = TimeSpan.FromSeconds(30);
+
+                try
+                {
+                    var response = await httpClient.GetAsync(subtitleUrl);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var content = await response.Content.ReadAsByteArrayAsync();
+                        
+                        // Check if we got actual subtitle content (not HTML error page)
+                        var contentString = System.Text.Encoding.UTF8.GetString(content, 0, Math.Min(content.Length, 1000));
+                        if (content.Length > 10 && !contentString.Contains("<html", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var contentType = response.Content.Headers.ContentType?.MediaType ?? "text/srt";
+
+                            _logger.LogInformation("Successfully serving subtitle from {SubtitleUrl}: {Length} bytes, type: {ContentType}", 
+                                subtitleUrl, content.Length, contentType);
+
+                            context.Response.ContentType = contentType;
+                            context.Response.ContentLength64 = content.Length;
+                            context.Response.AddHeader("Cache-Control", "max-age=3600");
+                            context.Response.AddHeader("Access-Control-Allow-Origin", "*");
+
+                            await context.Response.OutputStream.WriteAsync(content);
+                            context.Response.Close();
+                            return;
+                        }
+                        else
+                        {
+                            _logger.LogDebug("Got response but content appears to be error page from {SubtitleUrl}", subtitleUrl);
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogDebug("Failed to fetch subtitle from {SubtitleUrl}: {StatusCode}", subtitleUrl, response.StatusCode);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Exception trying subtitle URL {SubtitleUrl}", subtitleUrl);
+                }
+            }
+
+            _logger.LogWarning("All subtitle URL attempts failed for item {ItemId}, stream {StreamIndex}", itemId, streamIndex);
+            
+            // Return a simple "No subtitles available" message instead of 404
+            var fallbackContent = System.Text.Encoding.UTF8.GetBytes("1\n00:00:00,000 --> 00:00:01,000\n[No subtitles available]\n");
+            context.Response.ContentType = "text/srt";
+            context.Response.ContentLength64 = fallbackContent.Length;
+            await context.Response.OutputStream.WriteAsync(fallbackContent);
+            context.Response.Close();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error serving subtitle for item {ItemId}, stream {StreamIndex}", itemId, streamIndex);
+            context.Response.StatusCode = 500;
+            context.Response.Close();
+        }
+    }
+
+    // MARK: GetAlternativeSubtitleUrl
+    private string GetAlternativeSubtitleUrl(Guid itemId, int streamIndex, string format)
+    {
+        var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
+        var accessToken = _configuration["Jellyfin:AccessToken"];
+
+        // Try the alternative subtitle endpoint format
+        return $"{serverUrl}/Items/{itemId}/Subtitles/{streamIndex}/Stream.{format}?X-Emby-Token={accessToken}";
     }
 
     // MARK: HandleDeviceDescription

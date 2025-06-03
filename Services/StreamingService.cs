@@ -259,31 +259,78 @@ public class StreamingService
                 return;
             }
 
+            // Set basic content type
             context.Response.ContentType = streamInfo.MimeType;
             
+            // Forward Content-Length if available
             if (response.Content.Headers.ContentLength.HasValue)
             {
                 context.Response.ContentLength64 = response.Content.Headers.ContentLength.Value;
+                _logger.LogDebug("Forwarding Content-Length: {Length}", response.Content.Headers.ContentLength.Value);
             }
 
+            // Forward all relevant headers from Jellyfin response
+            foreach (var header in response.Headers)
+            {
+                switch (header.Key.ToLowerInvariant())
+                {
+                    case "accept-ranges":
+                        context.Response.AddHeader("Accept-Ranges", string.Join(", ", header.Value));
+                        break;
+                    case "cache-control":
+                        context.Response.AddHeader("Cache-Control", string.Join(", ", header.Value));
+                        break;
+                    case "last-modified":
+                        context.Response.AddHeader("Last-Modified", string.Join(", ", header.Value));
+                        break;
+                    case "etag":
+                        context.Response.AddHeader("ETag", string.Join(", ", header.Value));
+                        break;
+                }
+            }
+
+            // Forward Content headers
+            foreach (var header in response.Content.Headers)
+            {
+                switch (header.Key.ToLowerInvariant())
+                {
+                    case "content-range":
+                        context.Response.AddHeader("Content-Range", string.Join(", ", header.Value));
+                        break;
+                    case "content-disposition":
+                        context.Response.AddHeader("Content-Disposition", string.Join(", ", header.Value));
+                        break;
+                    case "content-encoding":
+                        context.Response.AddHeader("Content-Encoding", string.Join(", ", header.Value));
+                        break;
+                }
+            }
+
+            // Set status code
             if (response.StatusCode == HttpStatusCode.PartialContent)
             {
                 context.Response.StatusCode = 206;
-                if (response.Headers.Contains("Content-Range"))
-                {
-                    context.Response.AddHeader("Content-Range", response.Headers.GetValues("Content-Range").First());
-                }
+                _logger.LogDebug("Returning partial content (206)");
             }
             else
             {
                 context.Response.StatusCode = 200;
             }
 
+            // Set DLNA-specific headers
             context.Response.AddHeader("Accept-Ranges", "bytes");
-            context.Response.AddHeader("Cache-Control", "no-cache");
             context.Response.AddHeader("Connection", "keep-alive");
-
-            if (!streamInfo.IsDirectPlay)
+            
+            // Add transferMode.dlna.org header for better DLNA compatibility
+            context.Response.AddHeader("transferMode.dlna.org", "Streaming");
+            
+            // Add DLNA content features if it's a direct play
+            if (streamInfo.IsDirectPlay)
+            {
+                var dlnaFeatures = "DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000";
+                context.Response.AddHeader("contentFeatures.dlna.org", dlnaFeatures);
+            }
+            else
             {
                 context.Response.AddHeader("X-Transcoding", "true");
             }

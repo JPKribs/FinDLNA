@@ -72,7 +72,7 @@ builder.Services.AddScoped<DeviceProfileService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<JellyfinService>();
 builder.Services.AddSingleton<SsdpService>();
-builder.Services.AddSingleton<ContentDirectoryService>();
+builder.Services.AddScoped<ContentDirectoryService>();
 builder.Services.AddSingleton<StreamingService>();
 builder.Services.AddSingleton<DlnaService>();
 builder.Services.AddHostedService<DlnaBackgroundService>();
@@ -125,23 +125,28 @@ startupLogger.LogInformation("FinDLNA starting on http://localhost:5000");
 app.Run("http://localhost:5000");
 
 // MARK: DlnaBackgroundService
+// MARK: DlnaBackgroundService
 public class DlnaBackgroundService : BackgroundService
 {
     private readonly DlnaService _dlnaService;
     private readonly JellyfinService _jellyfinService;
     private readonly ILogger<DlnaBackgroundService> _logger;
     private readonly IServiceProvider _serviceProvider;
+    private readonly IConfiguration _configuration;
+    private Timer? _healthCheckTimer;
 
     public DlnaBackgroundService(
         DlnaService dlnaService, 
         JellyfinService jellyfinService, 
         ILogger<DlnaBackgroundService> logger,
-        IServiceProvider serviceProvider)
+        IServiceProvider serviceProvider,
+        IConfiguration configuration)
     {
         _dlnaService = dlnaService;
         _jellyfinService = jellyfinService;
         _logger = logger;
         _serviceProvider = serviceProvider;
+        _configuration = configuration;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -155,7 +160,27 @@ public class DlnaBackgroundService : BackgroundService
                     await _dlnaService.StartAsync();
                     _logger.LogInformation("DLNA service started successfully");
                     
-                    await Task.Delay(Timeout.Infinite, stoppingToken);
+                    StartHealthMonitoring(stoppingToken);
+                    
+                    while (!stoppingToken.IsCancellationRequested && _jellyfinService.IsConfigured)
+                    {
+                        try
+                        {
+                            await Task.Delay(30000, stoppingToken);
+                            
+                            if (!await IsServiceHealthy())
+                            {
+                                _logger.LogWarning("DLNA service appears unhealthy, restarting...");
+                                throw new InvalidOperationException("Service health check failed");
+                            }
+                            
+                            _logger.LogDebug("DLNA service health check passed");
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+                    }
                 }
                 catch (OperationCanceledException)
                 {
@@ -164,7 +189,21 @@ public class DlnaBackgroundService : BackgroundService
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Error in DLNA service, restarting in 30 seconds");
+                    
+                    try
+                    {
+                        await _dlnaService.StopAsync();
+                    }
+                    catch (Exception stopEx)
+                    {
+                        _logger.LogWarning(stopEx, "Error stopping DLNA service during restart");
+                    }
+                    
                     await Task.Delay(30000, stoppingToken);
+                }
+                finally
+                {
+                    _healthCheckTimer?.Dispose();
                 }
             }
             else
@@ -175,10 +214,70 @@ public class DlnaBackgroundService : BackgroundService
         }
     }
 
+    // MARK: StartHealthMonitoring
+    private void StartHealthMonitoring(CancellationToken stoppingToken)
+    {
+        _healthCheckTimer = new Timer(async _ =>
+        {
+            if (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    var isHealthy = await IsServiceHealthy();
+                    if (!isHealthy)
+                    {
+                        _logger.LogWarning("Health check timer detected unhealthy service");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Health check timer error");
+                }
+            }
+        }, null, TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(2));
+    }
+
+    // MARK: IsServiceHealthy
+    private async Task<bool> IsServiceHealthy()
+    {
+        try
+        {
+            var port = int.Parse(_configuration["Dlna:Port"] ?? "8200");
+            using var client = new HttpClient();
+            client.Timeout = TimeSpan.FromSeconds(10);
+            
+            var response = await client.GetAsync($"http://localhost:{port}/device.xml");
+            var isHealthy = response.IsSuccessStatusCode;
+            
+            if (!isHealthy)
+            {
+                _logger.LogWarning("Health check failed: HTTP {StatusCode}", response.StatusCode);
+            }
+            
+            return isHealthy;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Health check failed with exception");
+            return false;
+        }
+    }
+
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation("Stopping DLNA background service");
-        await _dlnaService.StopAsync();
+        
+        _healthCheckTimer?.Dispose();
+        
+        try
+        {
+            await _dlnaService.StopAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error stopping DLNA service");
+        }
+        
         await base.StopAsync(cancellationToken);
     }
 }

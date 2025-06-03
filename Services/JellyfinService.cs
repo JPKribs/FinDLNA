@@ -17,17 +17,17 @@ public class JellyfinService
     private readonly JellyfinApiClient _apiClient;
 
     public JellyfinService(
-        ILogger<JellyfinService> logger, 
+        ILogger<JellyfinService> logger,
         IConfiguration configuration,
         JellyfinApiClient apiClient)
     {
         _logger = logger;
         _configuration = configuration;
         _apiClient = apiClient;
-        
+
         if (IsConfigured)
         {
-            _logger.LogInformation("Jellyfin client initialized for server: {ServerUrl}", 
+            _logger.LogInformation("Jellyfin client initialized for server: {ServerUrl}",
                 _configuration["Jellyfin:ServerUrl"]);
         }
         else
@@ -44,7 +44,7 @@ public class JellyfinService
         try
         {
             var userId = Guid.Parse(_configuration["Jellyfin:UserId"] ?? "");
-            
+
             var response = await _apiClient.Items.GetAsync(requestConfiguration =>
             {
                 var accessToken = _configuration["Jellyfin:AccessToken"];
@@ -52,7 +52,7 @@ public class JellyfinService
                 {
                     requestConfiguration.Headers.Add("X-Emby-Token", accessToken);
                 }
-                
+
                 requestConfiguration.QueryParameters.UserId = userId;
                 requestConfiguration.QueryParameters.Recursive = false;
                 requestConfiguration.QueryParameters.EnableTotalRecordCount = true;
@@ -60,9 +60,9 @@ public class JellyfinService
                 requestConfiguration.QueryParameters.SortBy = [ItemSortBy.SortName];
                 requestConfiguration.QueryParameters.SortOrder = [SortOrder.Ascending];
             });
-            
+
             _logger.LogDebug("Retrieved {Count} library folders", response?.Items?.Count ?? 0);
-            
+
             return response?.Items;
         }
         catch (Exception ex)
@@ -80,7 +80,7 @@ public class JellyfinService
         try
         {
             var userId = Guid.Parse(_configuration["Jellyfin:UserId"] ?? "");
-            
+
             var response = await _apiClient.Items.GetAsync(requestConfiguration =>
             {
                 var accessToken = _configuration["Jellyfin:AccessToken"];
@@ -88,23 +88,23 @@ public class JellyfinService
                 {
                     requestConfiguration.Headers.Add("X-Emby-Token", accessToken);
                 }
-                
+
                 requestConfiguration.QueryParameters.UserId = userId;
                 requestConfiguration.QueryParameters.ParentId = libraryId;
                 requestConfiguration.QueryParameters.Recursive = true;
                 requestConfiguration.QueryParameters.EnableTotalRecordCount = true;
                 requestConfiguration.QueryParameters.SortBy = [ItemSortBy.SortName];
                 requestConfiguration.QueryParameters.SortOrder = [SortOrder.Ascending];
-                
+
                 requestConfiguration.QueryParameters.ExcludeItemTypes = [
                     BaseItemKind.Person,
                     BaseItemKind.Genre,
                     BaseItemKind.Studio
                 ];
             });
-            
+
             _logger.LogDebug("Retrieved {Count} items from library {LibraryId}", response?.Items?.Count ?? 0, libraryId);
-            
+
             return response?.Items;
         }
         catch (Exception ex)
@@ -122,7 +122,7 @@ public class JellyfinService
         try
         {
             var userId = Guid.Parse(_configuration["Jellyfin:UserId"] ?? "");
-            
+
             var response = await _apiClient.Items.GetAsync(requestConfiguration =>
             {
                 var accessToken = _configuration["Jellyfin:AccessToken"];
@@ -130,16 +130,16 @@ public class JellyfinService
                 {
                     requestConfiguration.Headers.Add("X-Emby-Token", accessToken);
                 }
-                
+
                 requestConfiguration.QueryParameters.UserId = userId;
                 requestConfiguration.QueryParameters.EnableTotalRecordCount = true;
-                
+
                 if (parentId.HasValue)
                 {
                     requestConfiguration.QueryParameters.ParentId = parentId.Value;
                     requestConfiguration.QueryParameters.Recursive = false;
                 }
-                
+
                 if (!string.IsNullOrEmpty(mediaTypes))
                 {
                     var mediaTypeEnums = mediaTypes.Split(',')
@@ -147,10 +147,10 @@ public class JellyfinService
                         .ToArray();
                     requestConfiguration.QueryParameters.MediaTypes = mediaTypeEnums;
                 }
-                
+
                 requestConfiguration.QueryParameters.SortBy = [ItemSortBy.SortName];
                 requestConfiguration.QueryParameters.SortOrder = [SortOrder.Ascending];
-                
+
                 requestConfiguration.QueryParameters.Fields = [
                     ItemFields.MediaSources,
                     ItemFields.MediaStreams,
@@ -160,9 +160,9 @@ public class JellyfinService
                     ItemFields.SortName
                 ];
             });
-            
+
             _logger.LogDebug("Retrieved {Count} items for parent {ParentId}", response?.Items?.Count ?? 0, parentId);
-            
+
             return response?.Items;
         }
         catch (Exception ex)
@@ -197,7 +197,7 @@ public class JellyfinService
     }
 
     // MARK: GetStreamUrlAsync
-    public string? GetStreamUrlAsync(Guid itemId)
+    public string? GetStreamUrlAsync(Guid itemId, string? container = null, bool includeDurationHeaders = true)
     {
         if (!IsConfigured) return null;
 
@@ -205,8 +205,25 @@ public class JellyfinService
         {
             var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
             var accessToken = _configuration["Jellyfin:AccessToken"];
-            
-            return $"{serverUrl}/Videos/{itemId}/stream?X-Emby-Token={accessToken}";
+
+            var queryParams = new List<string>
+            {
+                $"X-Emby-Token={accessToken}"
+            };
+
+            if (!string.IsNullOrEmpty(container))
+            {
+                queryParams.Add($"Container={container}");
+            }
+
+            if (includeDurationHeaders)
+            {
+                queryParams.Add("EnableRedirection=false");
+                queryParams.Add("EnableRemoteMedia=false");
+            }
+
+            var queryString = string.Join("&", queryParams);
+            return $"{serverUrl}/Videos/{itemId}/stream?{queryString}";
         }
         catch (Exception ex)
         {
@@ -224,7 +241,7 @@ public class JellyfinService
         {
             var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
             var accessToken = _configuration["Jellyfin:AccessToken"];
-            
+
             return $"{serverUrl}/Items/{itemId}/Images/{imageType}?X-Emby-Token={accessToken}";
         }
         catch (Exception ex)
@@ -235,7 +252,7 @@ public class JellyfinService
     }
 
     // MARK: IsConfigured
-    public bool IsConfigured => !string.IsNullOrEmpty(_configuration["Jellyfin:AccessToken"]) && 
+    public bool IsConfigured => !string.IsNullOrEmpty(_configuration["Jellyfin:AccessToken"]) &&
                                !string.IsNullOrEmpty(_configuration["Jellyfin:ServerUrl"]);
 
     // MARK: RefreshConfiguration
@@ -243,8 +260,28 @@ public class JellyfinService
     {
         if (IsConfigured)
         {
-            _logger.LogInformation("Configuration refreshed for server: {ServerUrl}", 
+            _logger.LogInformation("Configuration refreshed for server: {ServerUrl}",
                 _configuration["Jellyfin:ServerUrl"]);
+        }
+    }
+
+    // MARK: GetSubtitleUrlAsync
+    public string? GetSubtitleUrlAsync(Guid itemId, int subtitleStreamIndex, string format = "srt")
+    {
+        if (!IsConfigured) return null;
+
+        try
+        {
+            var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
+            var accessToken = _configuration["Jellyfin:AccessToken"];
+            
+            // For embedded subtitles, use the media info endpoint with stream index
+            return $"{serverUrl}/Videos/{itemId}/{subtitleStreamIndex}/Subtitles.{format}?X-Emby-Token={accessToken}";
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get subtitle URL for item {ItemId}, stream {StreamIndex}", itemId, subtitleStreamIndex);
+            return null;
         }
     }
 }

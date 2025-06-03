@@ -49,7 +49,7 @@ public class SsdpService : IDisposable
             
             _ = Task.Run(ListenForRequests);
             
-            _advertiseTimer = new Timer(SendAliveNotification, null, TimeSpan.Zero, TimeSpan.FromMinutes(30));
+            _advertiseTimer = new Timer(SendAliveNotification, null, TimeSpan.Zero, TimeSpan.FromMinutes(10));
             
             _logger.LogInformation("SSDP service started on port {Port}", SsdpPort);
             

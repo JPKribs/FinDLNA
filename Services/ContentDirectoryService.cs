@@ -2,6 +2,7 @@ using System.Text;
 using System.Xml.Linq;
 using System.Linq;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Configuration;
 using FinDLNA.Models;
 using FinDLNA.Services;
 using Jellyfin.Sdk.Generated.Models;
@@ -15,6 +16,7 @@ public class ContentDirectoryService
     private readonly JellyfinService _jellyfinService;
     private readonly DeviceProfileService _deviceProfileService;
     private readonly XmlTemplateService _xmlTemplateService;
+    private readonly IConfiguration _configuration;
 
     private static readonly HashSet<string> ExcludedFolderNames = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -51,12 +53,14 @@ public class ContentDirectoryService
         ILogger<ContentDirectoryService> logger,
         JellyfinService jellyfinService,
         DeviceProfileService deviceProfileService,
-        XmlTemplateService xmlTemplateService)
+        XmlTemplateService xmlTemplateService,
+        IConfiguration configuration)
     {
         _logger = logger;
         _jellyfinService = jellyfinService;
         _deviceProfileService = deviceProfileService;
         _xmlTemplateService = xmlTemplateService;
+        _configuration = configuration;
     }
 
     // MARK: GetServiceDescriptionXml
@@ -85,11 +89,11 @@ public class ContentDirectoryService
             var startingIndex = int.Parse(browseElement.Element("StartingIndex")?.Value ?? "0");
             var requestedCount = int.Parse(browseElement.Element("RequestedCount")?.Value ?? "0");
 
-            _logger.LogDebug("Browse request: ObjectID={ObjectId}, Flag={Flag}, Start={Start}, Count={Count}", 
+            _logger.LogDebug("Browse request: ObjectID={ObjectId}, Flag={Flag}, Start={Start}, Count={Count}",
                 objectId, browseFlag, startingIndex, requestedCount);
 
             var result = await ProcessBrowseAsync(objectId, browseFlag, startingIndex, requestedCount, userAgent);
-            
+
             return CreateBrowseResponse(result.DidlXml, result.NumberReturned, result.TotalMatches);
         }
         catch (Exception ex)
@@ -175,9 +179,9 @@ public class ContentDirectoryService
 
             var itemType = item.Type ?? BaseItemDto_Type.Folder;
             var itemName = item.Name ?? "Unknown";
-            
+
             _logger.LogDebug("Processing library item: {Name} (Type: {Type})", itemName, itemType);
-            
+
             if (ContainerTypes.Contains(itemType))
             {
                 var containerXml = CreateContainerXml(
@@ -210,9 +214,9 @@ public class ContentDirectoryService
             }
         }
 
-        _logger.LogInformation("BrowseLibraryAsync for {LibraryId}: Found {Total} items ({Containers} containers, {Media} media)", 
-            libraryId, allResults.Count, 
-            allResults.Count(x => x.isContainer), 
+        _logger.LogInformation("BrowseLibraryAsync for {LibraryId}: Found {Total} items ({Containers} containers, {Media} media)",
+            libraryId, allResults.Count,
+            allResults.Count(x => x.isContainer),
             allResults.Count(x => !x.isContainer));
 
         var sortedResults = allResults
@@ -285,15 +289,15 @@ public class ContentDirectoryService
             }
         }
 
-        _logger.LogInformation("BrowseItemAsync for {ItemId}: Found {Total} items ({Containers} containers, {Media} media)", 
-            itemId, allResults.Count, 
-            allResults.Count(x => x.isContainer), 
+        _logger.LogInformation("BrowseItemAsync for {ItemId}: Found {Total} items ({Containers} containers, {Media} media)",
+            itemId, allResults.Count,
+            allResults.Count(x => x.isContainer),
             allResults.Count(x => !x.isContainer));
 
         var sortedResults = allResults
             .OrderBy(x => !x.isContainer)
             .ThenBy(x => (x.item.Type == BaseItemDto_Type.Episode || x.item.Type == BaseItemDto_Type.Season)
-                ? x.item.IndexNumber ?? int.MaxValue 
+                ? x.item.IndexNumber ?? int.MaxValue
                 : int.MaxValue)
             .ThenBy(x => x.title)
             .ToList();
@@ -306,11 +310,11 @@ public class ContentDirectoryService
             .ToList();
 
         var didlXml = CreateDidlXml(string.Join("", paginatedResults));
-        return new BrowseResult 
-        { 
-            DidlXml = didlXml, 
-            NumberReturned = paginatedResults.Count, 
-            TotalMatches = totalMatches 
+        return new BrowseResult
+        {
+            DidlXml = didlXml,
+            NumberReturned = paginatedResults.Count,
+            TotalMatches = totalMatches
         };
     }
 
@@ -323,7 +327,18 @@ public class ContentDirectoryService
             return "";
         }
 
-        var streamUrl = _jellyfinService.GetStreamUrlAsync(item.Id.Value);
+        // Get duration from multiple sources
+        var runTimeTicks = item.RunTimeTicks;
+        var mediaSource = item.MediaSources?.FirstOrDefault();
+        
+        // Try to get duration from media source if main item doesn't have it
+        if ((!runTimeTicks.HasValue || runTimeTicks.Value == 0) && mediaSource?.RunTimeTicks.HasValue == true)
+        {
+            runTimeTicks = mediaSource.RunTimeTicks;
+            _logger.LogDebug("Using media source duration for item {ItemId}: {Duration} ticks", item.Id.Value, runTimeTicks);
+        }
+
+        var streamUrl = _jellyfinService.GetStreamUrlAsync(item.Id.Value, mediaSource?.Container);
         if (string.IsNullOrEmpty(streamUrl))
         {
             _logger.LogWarning("CreateItemXml: No stream URL for item {ItemId}", item.Id.Value);
@@ -332,8 +347,8 @@ public class ContentDirectoryService
 
         var mimeType = GetMimeTypeFromItem(item);
         var upnpClass = GetUpnpClass(item.Type ?? BaseItemDto_Type.Video);
-        var duration = FormatDuration(item.RunTimeTicks);
-        var size = item.MediaSources?.FirstOrDefault()?.Size ?? 0;
+        var duration = FormatDuration(runTimeTicks);
+        var size = mediaSource?.Size ?? 0;
         var resolution = GetResolution(item);
 
         var title = System.Security.SecurityElement.Escape(
@@ -347,18 +362,178 @@ public class ContentDirectoryService
             $"<upnp:albumArtURI>{albumArtUrl}</upnp:albumArtURI>" : "";
         
         var resolutionAttr = !string.IsNullOrEmpty(resolution) ? $" resolution=\"{resolution}\"" : "";
+        var durationAttr = !string.IsNullOrEmpty(duration) && duration != "0:00:00.000" ? $" duration=\"{duration}\"" : "";
         
-        _logger.LogDebug("Creating media item XML: {Title} (Type: {Type}, MIME: {MimeType})", 
-            title, item.Type, mimeType);
+        // Add bitrate info if available for VLC
+        var bitrate = mediaSource?.Bitrate;
+        var bitrateAttr = bitrate.HasValue ? $" bitrate=\"{bitrate.Value}\"" : "";
+        
+        // Get subtitle streams and add caption info
+        var captionInfo = GetCaptionInfoXml(item);
+        
+        // Get subtitle streams for resources
+        var subtitleResources = GetSubtitleResources(item);
+        
+        _logger.LogInformation("Creating media item XML: {Title} (Duration: {Duration}, Size: {Size}, Bitrate: {Bitrate}, Subtitles: {SubtitleCount})", 
+            title, duration, size, bitrate, subtitleResources.Count);
+        
+        var mainResource = $"<res protocolInfo=\"http-get:*:{mimeType}:*\" size=\"{size}\"{durationAttr}{resolutionAttr}{bitrateAttr}>{streamUrl}</res>";
         
         return $"""
             <item id="{item.Id.Value}" parentID="{parentId}" restricted="1">
                 <dc:title>{title}</dc:title>
                 <upnp:class>{upnpClass}</upnp:class>
                 {albumArtXml}
-                <res protocolInfo="http-get:*:{mimeType}:*" size="{size}" duration="{duration}"{resolutionAttr}>{streamUrl}</res>
+                {captionInfo}
+                {mainResource}
+                {string.Join("\n            ", subtitleResources)}
             </item>
             """;
+    }
+
+    // MARK: GetCaptionInfoXml
+    private string GetCaptionInfoXml(BaseItemDto item)
+    {
+        if (!item.Id.HasValue || item.MediaSources == null)
+            return "";
+
+        var captionInfos = new List<string>();
+
+        foreach (var mediaSource in item.MediaSources)
+        {
+            if (mediaSource.MediaStreams == null) continue;
+
+            var subtitleStreams = mediaSource.MediaStreams
+                .Where(s => s.Type == MediaStream_Type.Subtitle)
+                .ToList();
+
+            foreach (var subtitleStream in subtitleStreams)
+            {
+                if (subtitleStream.Index == null) continue;
+
+                var language = subtitleStream.Language ?? subtitleStream.Language ?? "en";
+                var localIp = GetLocalIPAddress();
+                var dlnaPort = _configuration["Dlna:Port"] ?? "8200";
+                var subtitleUrl = $"http://{localIp}:{dlnaPort}/subtitle/{item.Id.Value}/{subtitleStream.Index.Value}";
+
+                // Add DLNA CaptionInfo element
+                captionInfos.Add($"<sec:CaptionInfo sec:type=\"srt\">{subtitleUrl}</sec:CaptionInfo>");
+                captionInfos.Add($"<sec:CaptionInfoEx sec:type=\"srt\">{language}:{subtitleUrl}</sec:CaptionInfoEx>");
+            }
+        }
+
+        return string.Join("\n            ", captionInfos);
+    }
+
+    // MARK: GetSubtitleResources
+    private List<string> GetSubtitleResources(BaseItemDto item)
+    {
+        var subtitleResources = new List<string>();
+        
+        if (!item.Id.HasValue || item.MediaSources == null)
+            return subtitleResources;
+
+        _logger.LogDebug("Processing subtitles for item {ItemId}", item.Id.Value);
+
+        foreach (var mediaSource in item.MediaSources)
+        {
+            if (mediaSource.MediaStreams == null) continue;
+
+            _logger.LogDebug("MediaSource (Container: {Container}) has {StreamCount} streams", 
+                mediaSource.Container, mediaSource.MediaStreams.Count);
+
+            var subtitleStreams = mediaSource.MediaStreams
+                .Where(s => s.Type == MediaStream_Type.Subtitle)
+                .ToList();
+
+            _logger.LogDebug("Found {SubtitleCount} subtitle streams for item {ItemId}", subtitleStreams.Count, item.Id.Value);
+
+            foreach (var subtitleStream in subtitleStreams)
+            {
+                _logger.LogDebug("Subtitle stream: Index={Index}, Language={Language}, Codec={Codec}, IsExternal={IsExternal}, DisplayTitle={DisplayTitle}", 
+                    subtitleStream.Index, 
+                    subtitleStream.Language, 
+                    subtitleStream.Codec,
+                    subtitleStream.IsExternal,
+                    subtitleStream.DisplayTitle);
+
+                if (subtitleStream.Index == null) 
+                {
+                    _logger.LogWarning("Subtitle stream has null index, skipping");
+                    continue;
+                }
+
+                var language = subtitleStream.Language ?? subtitleStream.Language ?? subtitleStream.DisplayTitle ?? "unknown";
+                var codec = subtitleStream.Codec?.ToLowerInvariant() ?? "srt";
+                
+                // For embedded subtitles, always convert to SRT via Jellyfin
+                var format = "srt";
+                var mimeType = "text/srt";
+                
+                // Use local DLNA server URL
+                var localIp = GetLocalIPAddress();
+                var dlnaPort = _configuration["Dlna:Port"] ?? "8200";
+                var subtitleUrl = $"http://{localIp}:{dlnaPort}/subtitle/{item.Id.Value}/{subtitleStream.Index.Value}";
+                
+                // Create subtitle resource with proper DLNA attributes
+                var protocolInfo = $"http-get:*:{mimeType}:*";
+                
+                // Add language info to the protocol if available
+                if (!string.IsNullOrEmpty(language) && language != "unknown")
+                {
+                    var resourceXml = $"<res protocolInfo=\"{protocolInfo}\" dlna:subtitle=\"{language}\">{subtitleUrl}</res>";
+                    subtitleResources.Add(resourceXml);
+                }
+                else
+                {
+                    var resourceXml = $"<res protocolInfo=\"{protocolInfo}\">{subtitleUrl}</res>";
+                    subtitleResources.Add(resourceXml);
+                }
+                
+                _logger.LogInformation("Added embedded subtitle resource for item {ItemId}: {Language} ({Codec}) -> {Format} at {Url}, Stream Index: {StreamIndex}", 
+                    item.Id.Value, language, codec, format, subtitleUrl, subtitleStream.Index.Value);
+            }
+        }
+
+        return subtitleResources;
+    }
+
+    // MARK: GetLocalIPAddress
+    private string GetLocalIPAddress()
+    {
+        try
+        {
+            var host = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName());
+            foreach (var ip in host.AddressList)
+            {
+                if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !System.Net.IPAddress.IsLoopback(ip))
+                {
+                    return ip.ToString();
+                }
+            }
+        }
+        catch
+        {
+            // Fallback
+        }
+        return "127.0.0.1";
+    }
+
+    // MARK: GetSubtitleFormatAndMimeType
+    private (string format, string mimeType) GetSubtitleFormatAndMimeType(string codec)
+    {
+        return codec switch
+        {
+            "srt" or "subrip" => ("srt", "text/srt"),
+            "ass" or "ssa" => ("ass", "text/x-ass"),
+            "vtt" or "webvtt" => ("vtt", "text/vtt"),
+            "sub" => ("sub", "text/x-microdvd"),
+            "idx" => ("sub", "text/x-idx"),
+            "pgs" => ("srt", "text/srt"), // Convert PGS to SRT via Jellyfin
+            "dvdsub" => ("srt", "text/srt"), // Convert DVD subtitles to SRT
+            "dvbsub" => ("srt", "text/srt"), // Convert DVB subtitles to SRT
+            _ => ("srt", "text/srt") // Default to SRT for unknown formats
+        };
     }
 
     // MARK: CreateContainerXml
@@ -366,9 +541,9 @@ public class ContentDirectoryService
     {
         var escapedTitle = System.Security.SecurityElement.Escape(title);
         var albumArtUrl = itemId.HasValue ? GetAlbumArtUrl(itemId.Value) : "";
-        var albumArtXml = !string.IsNullOrEmpty(albumArtUrl) ? 
+        var albumArtXml = !string.IsNullOrEmpty(albumArtUrl) ?
             $"<upnp:albumArtURI>{albumArtUrl}</upnp:albumArtURI>" : "";
-        
+
         return $"""
             <container id="{id}" parentID="{parentId}" restricted="1" childCount="{childCount}">
                 <dc:title>{escapedTitle}</dc:title>
@@ -389,12 +564,12 @@ public class ContentDirectoryService
     {
         var videoStream = item.MediaSources?.FirstOrDefault()?.MediaStreams?
             .FirstOrDefault(s => s.Type == MediaStream_Type.Video);
-        
+
         if (videoStream?.Width.HasValue == true && videoStream?.Height.HasValue == true)
         {
             return $"{videoStream.Width}x{videoStream.Height}";
         }
-        
+
         return "";
     }
 
@@ -404,7 +579,8 @@ public class ContentDirectoryService
         return $"""
             <DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" 
                        xmlns:dc="http://purl.org/dc/elements/1.1/" 
-                       xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
+                       xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"
+                       xmlns:sec="http://www.sec.co.kr/">
                 {content}
             </DIDL-Lite>
             """;
@@ -461,10 +637,24 @@ public class ContentDirectoryService
     // MARK: FormatDuration
     private string FormatDuration(long? runTimeTicks)
     {
-        if (!runTimeTicks.HasValue) return "0:00:00";
-        
+        if (!runTimeTicks.HasValue || runTimeTicks.Value <= 0)
+            return "0:00:00.000";
+
         var timeSpan = TimeSpan.FromTicks(runTimeTicks.Value);
-        return $"{(int)timeSpan.TotalHours:00}:{timeSpan.Minutes:00}:{timeSpan.Seconds:00}";
+
+        // VLC DLNA expects specific format - try multiple approaches
+        var hours = (int)timeSpan.TotalHours;
+        var minutes = timeSpan.Minutes;
+        var seconds = timeSpan.Seconds;
+        var milliseconds = timeSpan.Milliseconds;
+
+        // Format as H:MM:SS.mmm - this is the DLNA standard
+        var formattedDuration = $"{hours}:{minutes:00}:{seconds:00}.{milliseconds:000}";
+
+        _logger.LogDebug("Formatted duration for DLNA: {RunTimeTicks} ticks ({TotalSeconds}s) -> {FormattedDuration}",
+            runTimeTicks.Value, timeSpan.TotalSeconds, formattedDuration);
+
+        return formattedDuration;
     }
 
     // MARK: ProcessSearchCapabilitiesRequest
