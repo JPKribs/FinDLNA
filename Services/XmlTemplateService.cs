@@ -12,6 +12,32 @@ public class XmlTemplateService
     public XmlTemplateService(ILogger<XmlTemplateService> logger)
     {
         _logger = logger;
+        LogAvailableResources(); // MARK: Debug helper
+    }
+
+    // MARK: LogAvailableResources
+    private void LogAvailableResources()
+    {
+        try
+        {
+            var assembly = Assembly.GetExecutingAssembly();
+            var resourceNames = assembly.GetManifestResourceNames();
+            
+            _logger.LogInformation("Available embedded resources:");
+            foreach (var resourceName in resourceNames)
+            {
+                _logger.LogInformation("  - {ResourceName}", resourceName);
+            }
+            
+            if (resourceNames.Length == 0)
+            {
+                _logger.LogError("No embedded resources found! Check your .csproj file.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error listing embedded resources");
+        }
     }
 
     // MARK: GetTemplate
@@ -25,6 +51,13 @@ public class XmlTemplateService
             }
 
             var template = _templates[templateName];
+            
+            if (string.IsNullOrEmpty(template))
+            {
+                _logger.LogError("Template {TemplateName} is empty after loading", templateName);
+                return CreateErrorTemplate(templateName);
+            }
+
             return args.Length > 0 ? string.Format(template, args) : template;
         }
         catch (Exception ex)
@@ -40,36 +73,51 @@ public class XmlTemplateService
         var assembly = Assembly.GetExecutingAssembly();
         var resourceName = $"FinDLNA.Templates.{templateName}.xml";
 
-        _logger.LogDebug("Loading template: {ResourceName}", resourceName);
+        _logger.LogDebug("Attempting to load template: {ResourceName}", resourceName);
 
         using var stream = assembly.GetManifestResourceStream(resourceName);
         if (stream == null)
         {
             _logger.LogError("Template resource not found: {ResourceName}", resourceName);
+            
+            // MARK: Try alternative resource names
+            var allResources = assembly.GetManifestResourceNames();
+            var possibleMatches = allResources.Where(r => r.Contains(templateName)).ToList();
+            
+            if (possibleMatches.Any())
+            {
+                _logger.LogInformation("Possible template matches found:");
+                foreach (var match in possibleMatches)
+                {
+                    _logger.LogInformation("  - {Match}", match);
+                }
+            }
+            
             throw new FileNotFoundException($"Template '{templateName}' not found as embedded resource");
         }
 
         using var reader = new StreamReader(stream);
         var content = reader.ReadToEnd();
         
-        _logger.LogDebug("Loaded template {TemplateName}: {Length} characters", templateName, content.Length);
+        _logger.LogInformation("Successfully loaded template {TemplateName}: {Length} characters", templateName, content.Length);
+        _logger.LogDebug("Template content preview: {Preview}", content.Substring(0, Math.Min(100, content.Length)));
+        
         return content;
     }
 
     // MARK: CreateErrorTemplate
     private string CreateErrorTemplate(string templateName)
     {
-        return $"""
+        var errorXml = $"""
             <?xml version="1.0"?>
-            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
-                <s:Body>
-                    <s:Fault>
-                        <faultcode>s:Server</faultcode>
-                        <faultstring>Template Error: {templateName} not found</faultstring>
-                    </s:Fault>
-                </s:Body>
-            </s:Envelope>
+            <error>
+                <message>Template '{templateName}' not found</message>
+                <timestamp>{DateTime.UtcNow:yyyy-MM-ddTHH:mm:ssZ}</timestamp>
+            </error>
             """;
+            
+        _logger.LogWarning("Returning error template for missing {TemplateName}", templateName);
+        return errorXml;
     }
 
     // MARK: ClearCache

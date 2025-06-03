@@ -251,6 +251,7 @@ public class DlnaService : IDisposable
             var soapBody = await reader.ReadToEndAsync();
 
             _logger.LogDebug("SOAP Action: {Action}", soapAction);
+            _logger.LogTrace("SOAP Body: {Body}", soapBody);
 
             string responseXml;
             if (soapAction.Contains("Browse"))
@@ -264,6 +265,10 @@ public class DlnaService : IDisposable
             else if (soapAction.Contains("GetSortCapabilities"))
             {
                 responseXml = _contentDirectoryService.ProcessSortCapabilitiesRequest();
+            }
+            else if (soapAction.Contains("GetSystemUpdateID"))
+            {
+                responseXml = CreateGetSystemUpdateIDResponse();
             }
             else
             {
@@ -414,87 +419,10 @@ public class DlnaService : IDisposable
         response.Close();
     }
 
-    // MARK: GetConnectionManagerDescriptionXml
-    private string GetConnectionManagerDescriptionXml()
+    // MARK: CreateGetSystemUpdateIDResponse
+    private string CreateGetSystemUpdateIDResponse()
     {
-        return """
-        <?xml version="1.0"?>
-        <scpd xmlns="urn:schemas-upnp-org:service-1-0">
-            <specVersion>
-                <major>1</major>
-                <minor>0</minor>
-            </specVersion>
-            <actionList>
-                <action>
-                    <name>GetProtocolInfo</name>
-                    <argumentList>
-                        <argument>
-                            <name>Source</name>
-                            <direction>out</direction>
-                            <relatedStateVariable>SourceProtocolInfo</relatedStateVariable>
-                        </argument>
-                        <argument>
-                            <name>Sink</name>
-                            <direction>out</direction>
-                            <relatedStateVariable>SinkProtocolInfo</relatedStateVariable>
-                        </argument>
-                    </argumentList>
-                </action>
-                <action>
-                    <name>GetCurrentConnectionIDs</name>
-                    <argumentList>
-                        <argument>
-                            <name>ConnectionIDs</name>
-                            <direction>out</direction>
-                            <relatedStateVariable>CurrentConnectionIDs</relatedStateVariable>
-                        </argument>
-                    </argumentList>
-                </action>
-            </actionList>
-            <serviceStateTable>
-                <stateVariable sendEvents="yes">
-                    <name>SourceProtocolInfo</name>
-                    <dataType>string</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="yes">
-                    <name>SinkProtocolInfo</name>
-                    <dataType>string</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="yes">
-                    <name>CurrentConnectionIDs</name>
-                    <dataType>string</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_ConnectionStatus</name>
-                    <dataType>string</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_ConnectionManager</name>
-                    <dataType>string</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_Direction</name>
-                    <dataType>string</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_ProtocolInfo</name>
-                    <dataType>string</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_ConnectionID</name>
-                    <dataType>i4</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_AVTransportID</name>
-                    <dataType>i4</dataType>
-                </stateVariable>
-                <stateVariable sendEvents="no">
-                    <name>A_ARG_TYPE_RcsID</name>
-                    <dataType>i4</dataType>
-                </stateVariable>
-            </serviceStateTable>
-        </scpd>
-        """;
+        return _xmlTemplateService.GetTemplate("GetSystemUpdateIdResponse");
     }
 
     // MARK: CreateGetProtocolInfoResponse

@@ -1,0 +1,5 @@
+<container id="{0}" parentID="{1}" restricted="1" searchable="1" childCount="{2}">
+    <dc:title>{3}</dc:title>
+    <upnp:class>{4}</upnp:class>
+    {5}
+</container>

@@ -5,6 +5,7 @@ using System.Text.Json;
 using Jellyfin.Sdk.Generated.Models;
 using FinDLNA.Utilities;
 using FinDLNA.Models;
+using System.Collections.Concurrent;
 
 namespace FinDLNA.Services;
 
@@ -14,7 +15,9 @@ public class PlaybackReportingService
     private readonly ILogger<PlaybackReportingService> _logger;
     private readonly IConfiguration _configuration;
     private readonly HttpClient _httpClient;
-    private readonly Dictionary<string, PlaybackSession> _activeSessions = new();
+    private readonly ConcurrentDictionary<string, PlaybackSession> _activeSessions = new();
+    private readonly ConcurrentDictionary<string, object> _sessionLocks = new();
+    private readonly object _globalLock = new object();
 
     public PlaybackReportingService(
         ILogger<PlaybackReportingService> logger,
@@ -29,6 +32,12 @@ public class PlaybackReportingService
     // MARK: IsConfigured
     private bool IsConfigured => !string.IsNullOrEmpty(_configuration["Jellyfin:AccessToken"]) &&
                                !string.IsNullOrEmpty(_configuration["Jellyfin:ServerUrl"]);
+
+    // MARK: GetSessionLock
+    private object GetSessionLock(string sessionId)
+    {
+        return _sessionLocks.GetOrAdd(sessionId, _ => new object());
+    }
 
     // MARK: StartPlaybackAsync
     public async Task<string?> StartPlaybackAsync(Guid itemId, string? userAgent = null, string? clientEndpoint = null, long? startPositionTicks = null)
@@ -66,7 +75,7 @@ public class PlaybackReportingService
                 RepeatMode = "RepeatNone",
                 MaxStreamingBitrate = 120000000,
                 StartTimeTicks = actualStartPosition,
-                PositionTicks = actualStartPosition, // MARK: Also set current position
+                PositionTicks = actualStartPosition,
                 VolumeLevel = 100,
                 Brightness = 100,
                 AspectRatio = "16:9",
@@ -131,14 +140,39 @@ public class PlaybackReportingService
     // MARK: UpdatePlaybackProgressAsync
     public async Task UpdatePlaybackProgressAsync(string sessionId, long positionTicks, bool isPaused = false)
     {
-        try
+        if (!_activeSessions.TryGetValue(sessionId, out var session))
         {
-            if (!_activeSessions.TryGetValue(sessionId, out var session))
+            _logger.LogDebug("Session {SessionId} not found for progress update", sessionId);
+            return;
+        }
+
+        var sessionLock = GetSessionLock(sessionId);
+        lock (sessionLock)
+        {
+            // MARK: Double-check session still exists after acquiring lock
+            if (!_activeSessions.TryGetValue(sessionId, out session))
             {
-                _logger.LogDebug("Session {SessionId} not found for progress update", sessionId);
+                _logger.LogDebug("Session {SessionId} was removed during progress update", sessionId);
                 return;
             }
 
+            // MARK: Update session state
+            session.LastProgressUpdate = DateTimeOffset.UtcNow;
+            session.LastPositionTicks = positionTicks;
+            session.IsPaused = isPaused;
+
+            if (isPaused)
+            {
+                session.PauseTime = DateTimeOffset.UtcNow;
+            }
+            else
+            {
+                session.PauseTime = null;
+            }
+        }
+
+        try
+        {
             if (!IsConfigured)
             {
                 _logger.LogWarning("Jellyfin not configured for progress update");
@@ -180,10 +214,6 @@ public class PlaybackReportingService
 
             if (response.IsSuccessStatusCode)
             {
-                session.LastProgressUpdate = DateTimeOffset.UtcNow;
-                session.LastPositionTicks = positionTicks;
-                session.IsPaused = isPaused;
-
                 _logger.LogDebug("PROGRESS UPDATED: Session {SessionId} at {Position}ms, paused: {IsPaused}", 
                     sessionId, TimeConversionUtil.TicksToMilliseconds(positionTicks), isPaused);
             }
@@ -205,13 +235,8 @@ public class PlaybackReportingService
     {
         await UpdatePlaybackProgressAsync(sessionId, positionTicks, isPaused: true);
         
-        if (_activeSessions.TryGetValue(sessionId, out var session))
-        {
-            session.IsPaused = true;
-            session.PauseTime = DateTimeOffset.UtcNow;
-            _logger.LogInformation("Paused playback session {SessionId} at position {Position}ms", 
-                sessionId, TimeConversionUtil.TicksToMilliseconds(positionTicks));
-        }
+        _logger.LogInformation("Paused playback session {SessionId} at position {Position}ms", 
+            sessionId, TimeConversionUtil.TicksToMilliseconds(positionTicks));
     }
 
     // MARK: ResumePlaybackAsync
@@ -219,26 +244,28 @@ public class PlaybackReportingService
     {
         await UpdatePlaybackProgressAsync(sessionId, positionTicks, isPaused: false);
         
-        if (_activeSessions.TryGetValue(sessionId, out var session))
-        {
-            session.IsPaused = false;
-            session.PauseTime = null;
-            _logger.LogInformation("Resumed playback session {SessionId} from position {Position}ms", 
-                sessionId, TimeConversionUtil.TicksToMilliseconds(positionTicks));
-        }
+        _logger.LogInformation("Resumed playback session {SessionId} from position {Position}ms", 
+            sessionId, TimeConversionUtil.TicksToMilliseconds(positionTicks));
     }
 
     // MARK: StopPlaybackAsync
     public async Task StopPlaybackAsync(string sessionId, long? finalPositionTicks = null, bool markAsWatched = false)
     {
-        try
+        var sessionLock = GetSessionLock(sessionId);
+        PlaybackSession? session = null;
+
+        lock (sessionLock)
         {
-            if (!_activeSessions.TryGetValue(sessionId, out var session))
+            // MARK: Check if session exists and remove it atomically
+            if (!_activeSessions.TryRemove(sessionId, out session))
             {
-                _logger.LogWarning("Session {SessionId} not found for stop", sessionId);
+                _logger.LogDebug("Session {SessionId} not found or already removed for stop", sessionId);
                 return;
             }
+        }
 
+        try
+        {
             if (!IsConfigured)
             {
                 _logger.LogWarning("Jellyfin not configured for stop playback");
@@ -293,12 +320,18 @@ public class PlaybackReportingService
                 _logger.LogWarning("Failed to stop playback session: {StatusCode} - {Content}", 
                     response.StatusCode, errorContent);
             }
-
-            _activeSessions.Remove(sessionId);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error stopping playback session {SessionId}", sessionId);
+        }
+        finally
+        {
+            // MARK: Clean up session lock
+            lock (_globalLock)
+            {
+                _sessionLocks.TryRemove(sessionId, out _);
+            }
         }
     }
 
@@ -348,17 +381,17 @@ public class PlaybackReportingService
     // MARK: CleanupStaleSessionsAsync
     public async Task CleanupStaleSessionsAsync()
     {
-        var staleThreshold = TimeSpan.FromMinutes(15); // Increased for better long movie support
-        var pausedThreshold = TimeSpan.FromHours(2);   // Allow 2 hour paused sessions for long movies
+        var staleThreshold = TimeSpan.FromMinutes(15);
+        var pausedThreshold = TimeSpan.FromHours(2);
         var now = DateTimeOffset.UtcNow;
         var staleSessions = new List<string>();
 
+        // MARK: Identify stale sessions
         foreach (var kvp in _activeSessions)
         {
             var session = kvp.Value;
             var timeSinceUpdate = now - session.LastProgressUpdate;
             
-            // If session is paused, use much longer threshold for long movies
             var threshold = session.IsPaused ? pausedThreshold : staleThreshold;
             
             if (timeSinceUpdate > threshold)
@@ -369,6 +402,7 @@ public class PlaybackReportingService
             }
         }
 
+        // MARK: Clean up stale sessions
         foreach (var sessionId in staleSessions)
         {
             _logger.LogInformation("Cleaning up stale session {SessionId}", sessionId);
@@ -380,6 +414,19 @@ public class PlaybackReportingService
     public Task<PlaybackSession?> GetSessionByItemAsync(Guid itemId)
     {
         var session = _activeSessions.Values.FirstOrDefault(s => s.ItemId == itemId);
+        return Task.FromResult(session);
+    }
+
+    // MARK: SessionExists
+    public bool SessionExists(string sessionId)
+    {
+        return _activeSessions.ContainsKey(sessionId);
+    }
+
+    // MARK: GetSessionAsync
+    public Task<PlaybackSession?> GetSessionAsync(string sessionId)
+    {
+        _activeSessions.TryGetValue(sessionId, out var session);
         return Task.FromResult(session);
     }
 }

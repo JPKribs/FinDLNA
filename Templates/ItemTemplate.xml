@@ -1,0 +1,7 @@
+<item id="{0}" parentID="{1}" restricted="1" searchable="0">
+    <dc:title>{2}</dc:title>
+    <dc:date>{3}</dc:date>
+    <upnp:class>{4}</upnp:class>
+    {5}
+    <res protocolInfo="{6}"{7}>{8}</res>
+</item>

@@ -7,6 +7,7 @@ using FinDLNA.Models;
 using FinDLNA.Utilities;
 using System.Text.Json;
 using System.Globalization;
+using System.Collections.Concurrent;
 
 namespace FinDLNA.Services;
 
@@ -18,7 +19,9 @@ public class StreamingService
     private readonly JellyfinService _jellyfinService;
     private readonly DeviceProfileService _deviceProfileService;
     private readonly PlaybackReportingService _playbackReportingService;
-    private readonly Dictionary<string, StreamProgress> _streamProgress = new();
+    private readonly ConcurrentDictionary<Guid, string> _itemToSessionMap = new();
+    private readonly ConcurrentDictionary<string, StreamProgress> _streamProgress = new();
+    private readonly object _sessionLock = new object();
 
     public StreamingService(
         ILogger<StreamingService> logger,
@@ -66,89 +69,31 @@ public class StreamingService
             }
 
             var resumePositionTicks = await GetResumePositionAsync(guid);
-            var shouldResume = resumePositionTicks > 0;
             var rangeRequest = ParseRangeHeader(context.Request.Headers["Range"]);
 
-            // MARK: Handle range requests for seeking
-            long? seekPositionTicks = null;
-            if (rangeRequest.HasValue && item.RunTimeTicks.HasValue)
-            {
-                seekPositionTicks = CalculateSeekPosition(rangeRequest.Value, item.RunTimeTicks.Value, resumePositionTicks);
-                _logger.LogInformation("SEEK REQUEST: Range {RangeStart} -> seek position {SeekMs}ms", 
-                    rangeRequest.Value, TimeConversionUtil.TicksToMilliseconds(seekPositionTicks ?? 0));
-            }
+            // MARK: Get or create session for this item
+            sessionId = await GetOrCreateSessionAsync(guid, userAgent, clientEndpoint, resumePositionTicks, rangeRequest, item.RunTimeTicks ?? 0);
 
-            var existingSession = await _playbackReportingService.GetSessionByItemAsync(guid);
-            if (existingSession != null)
+            if (sessionId == null)
             {
-                sessionId = existingSession.SessionId;
-                _logger.LogInformation("EXISTING SESSION: Using session {SessionId} for item {ItemId}", sessionId, itemId);
-
-                if (seekPositionTicks.HasValue)
-                {
-                    await _playbackReportingService.UpdatePlaybackProgressAsync(sessionId, seekPositionTicks.Value, isPaused: false);
-                    _streamProgress[sessionId] = new StreamProgress 
-                    { 
-                        CurrentTicks = seekPositionTicks.Value, 
-                        StartTime = DateTime.UtcNow,
-                        LastUpdateTime = DateTime.UtcNow 
-                    };
-                    _logger.LogInformation("SEEK UPDATE: Session {SessionId} seeking to {Position}ms", 
-                        sessionId, TimeConversionUtil.TicksToMilliseconds(seekPositionTicks.Value));
-                }
-                else if (existingSession.IsPaused)
-                {
-                    await _playbackReportingService.ResumePlaybackAsync(sessionId, existingSession.LastPositionTicks);
-                    // MARK: Initialize or update progress tracking for resumed session
-                    _streamProgress[sessionId] = new StreamProgress 
-                    { 
-                        CurrentTicks = existingSession.LastPositionTicks, 
-                        StartTime = DateTime.UtcNow,
-                        LastUpdateTime = DateTime.UtcNow 
-                    };
-                    _logger.LogInformation("RESUME: Session {SessionId} resuming from {Position}ms", 
-                        sessionId, TimeConversionUtil.TicksToMilliseconds(existingSession.LastPositionTicks));
-                }
-                else if (!_streamProgress.ContainsKey(sessionId))
-                {
-                    // MARK: Initialize progress tracking for existing session without tracking
-                    _streamProgress[sessionId] = new StreamProgress 
-                    { 
-                        CurrentTicks = existingSession.LastPositionTicks, 
-                        StartTime = DateTime.UtcNow,
-                        LastUpdateTime = DateTime.UtcNow 
-                    };
-                }
-            }
-            else
-            {
-                var startPosition = seekPositionTicks ?? (shouldResume ? resumePositionTicks : 0);
-                sessionId = await _playbackReportingService.StartPlaybackAsync(guid, userAgent, clientEndpoint, startPosition);
-                
-                if (sessionId != null)
-                {
-                    _streamProgress[sessionId] = new StreamProgress 
-                    { 
-                        CurrentTicks = startPosition, 
-                        StartTime = DateTime.UtcNow,
-                        LastUpdateTime = DateTime.UtcNow 
-                    };
-                    
-                    _logger.LogInformation("NEW SESSION: Started session {SessionId} at position {StartMs}ms", 
-                        sessionId, TimeConversionUtil.TicksToMilliseconds(startPosition));
-                }
+                _logger.LogError("Failed to create session for item {ItemId}", itemId);
+                await SendErrorResponse(context, HttpStatusCode.InternalServerError, "Session creation failed");
+                return;
             }
 
             var streamRequest = ParseStreamRequest(context, deviceProfile);
             
-            // MARK: Set start position for transcoding
-            if (seekPositionTicks.HasValue)
+            // MARK: Handle seeking - only update position if it's a significant seek
+            if (rangeRequest.HasValue && item.RunTimeTicks.HasValue)
             {
-                streamRequest.StartTimeTicks = seekPositionTicks;
-            }
-            else if (shouldResume && existingSession == null)
-            {
-                streamRequest.StartTimeTicks = resumePositionTicks;
+                var seekPositionTicks = CalculateSeekPosition(rangeRequest.Value, item.RunTimeTicks.Value, resumePositionTicks);
+                
+                // MARK: Only treat as seek if the byte offset is significant
+                if (rangeRequest.Value > 1024 * 1024) // > 1MB
+                {
+                    streamRequest.StartTimeTicks = seekPositionTicks;
+                    await UpdateSessionPosition(sessionId, seekPositionTicks);
+                }
             }
 
             var streamInfo = await GetOptimalStreamAsync(item, streamRequest, deviceProfile);
@@ -165,13 +110,130 @@ public class StreamingService
         {
             _logger.LogError(ex, "Error handling stream request for item {ItemId}", itemId);
 
-            if (sessionId != null)
+            if (sessionId != null && itemGuid.HasValue)
             {
-                _streamProgress.Remove(sessionId);
-                await _playbackReportingService.StopPlaybackAsync(sessionId, markAsWatched: false);
+                await CleanupSession(sessionId, itemGuid.Value, markAsWatched: false);
             }
 
             await SendErrorResponse(context, HttpStatusCode.InternalServerError, "Stream error");
+        }
+    }
+
+    // MARK: GetOrCreateSessionAsync
+    private async Task<string?> GetOrCreateSessionAsync(Guid itemId, string userAgent, string clientEndpoint, long resumePositionTicks, long? rangeRequest, long totalDurationTicks)
+    {
+        // MARK: For VLC and seeking operations, always create new sessions
+        bool isSeekOperation = rangeRequest.HasValue && rangeRequest.Value > 1024 * 1024; // > 1MB
+        bool isVLC = userAgent.Contains("VLC", StringComparison.OrdinalIgnoreCase);
+        
+        if (!isSeekOperation && !isVLC)
+        {
+            lock (_sessionLock)
+            {
+                // MARK: Check if we already have a session for this item (only for non-VLC clients)
+                if (_itemToSessionMap.TryGetValue(itemId, out var existingSessionId))
+                {
+                    _logger.LogInformation("REUSING SESSION: Found existing session {SessionId} for item {ItemId}", existingSessionId, itemId);
+                    return existingSessionId;
+                }
+            }
+        }
+
+        // MARK: Clean up any existing session for this item before creating new one
+        if (_itemToSessionMap.TryGetValue(itemId, out var oldSessionId))
+        {
+            _logger.LogInformation("REPLACING SESSION: Cleaning up old session {OldSessionId} for new request", oldSessionId);
+            await CleanupSession(oldSessionId, itemId, markAsWatched: false);
+        }
+
+        // MARK: Determine start position
+        long startPosition = 0;
+        if (rangeRequest.HasValue && totalDurationTicks > 0)
+        {
+            startPosition = CalculateSeekPosition(rangeRequest.Value, totalDurationTicks, resumePositionTicks);
+        }
+        else if (resumePositionTicks > 0 && !isVLC) // VLC handles resume internally
+        {
+            startPosition = resumePositionTicks;
+        }
+
+        // MARK: Create new session
+        var newSessionId = await _playbackReportingService.StartPlaybackAsync(itemId, userAgent, clientEndpoint, startPosition);
+        
+        if (newSessionId != null)
+        {
+            lock (_sessionLock)
+            {
+                _itemToSessionMap[itemId] = newSessionId;
+                _streamProgress[newSessionId] = new StreamProgress
+                {
+                    CurrentTicks = startPosition,
+                    StartTime = DateTime.UtcNow,
+                    LastUpdateTime = DateTime.UtcNow
+                };
+            }
+
+            _logger.LogInformation("NEW SESSION: Created session {SessionId} for item {ItemId} at position {StartMs}ms", 
+                newSessionId, itemId, TimeConversionUtil.TicksToMilliseconds(startPosition));
+        }
+
+        return newSessionId;
+    }
+
+    // MARK: UpdateSessionPosition
+    private async Task UpdateSessionPosition(string sessionId, long newPositionTicks)
+    {
+        if (_streamProgress.TryGetValue(sessionId, out var progress))
+        {
+            progress.CurrentTicks = newPositionTicks;
+            progress.LastUpdateTime = DateTime.UtcNow;
+            
+            await _playbackReportingService.UpdatePlaybackProgressAsync(sessionId, newPositionTicks, isPaused: false);
+            
+            _logger.LogInformation("SEEK UPDATE: Session {SessionId} seeking to {Position}ms", 
+                sessionId, TimeConversionUtil.TicksToMilliseconds(newPositionTicks));
+        }
+    }
+
+    // MARK: CleanupSession
+    private async Task CleanupSession(string sessionId, Guid itemId, bool markAsWatched = false, long? finalPosition = null)
+    {
+        if (string.IsNullOrEmpty(sessionId)) return;
+
+        bool shouldStop = false;
+        
+        try
+        {
+            lock (_sessionLock)
+            {
+                // MARK: Only proceed if we successfully remove the session mapping
+                if (_itemToSessionMap.TryRemove(itemId, out var mappedSessionId) && mappedSessionId == sessionId)
+                {
+                    shouldStop = true;
+                    
+                    if (_streamProgress.TryGetValue(sessionId, out var progress))
+                    {
+                        finalPosition ??= progress.CurrentTicks;
+                    }
+                    
+                    _streamProgress.TryRemove(sessionId, out _);
+                }
+            }
+
+            // MARK: Only stop playback if we were the ones to remove the mapping
+            if (shouldStop)
+            {
+                await _playbackReportingService.StopPlaybackAsync(sessionId, finalPosition, markAsWatched);
+                _logger.LogInformation("SESSION CLEANUP: Cleaned up session {SessionId} for item {ItemId}", sessionId, itemId);
+            }
+            else
+            {
+                _logger.LogDebug("SESSION CLEANUP: Session {SessionId} already cleaned up", sessionId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error cleaning up session {SessionId}", sessionId);
         }
     }
 
@@ -378,15 +440,15 @@ public class StreamingService
             "VideoCodec=h264", 
             "AudioCodec=aac",
             "TranscodingMaxAudioChannels=8",
-            "BreakOnNonKeyFrames=false", // MARK: Changed to improve seeking
+            "BreakOnNonKeyFrames=false",
             "EnableRedirection=false",
             "EnableRemoteMedia=false",
             "SegmentContainer=mp4",
-            "MinSegments=0", // MARK: Disable segmentation for single file
+            "MinSegments=0",
             "TranscodeSeekInfo=Auto",
             "CopyTimestamps=false",
             "EnableMpegtsM2TsMode=false",
-            "EnableSubtitlesInManifest=false", // MARK: Disable for compatibility
+            "EnableSubtitlesInManifest=false",
             "AllowVideoStreamCopy=false",
             "AllowAudioStreamCopy=false",
             "RequireAvc=true",
@@ -437,17 +499,19 @@ public class StreamingService
     }
 
     // MARK: StreamMediaAsync
-    private async Task StreamMediaAsync(HttpListenerContext context, StreamInfo streamInfo, StreamRequest streamRequest, string? sessionId, long? rangeStart)
+    private async Task StreamMediaAsync(HttpListenerContext context, StreamInfo streamInfo, StreamRequest streamRequest, string sessionId, long? rangeStart)
     {
         HttpClient? httpClient = null;
         Stream? sourceStream = null;
         long totalBytesStreamed = 0;
         var startTime = DateTime.UtcNow;
+        bool sessionHandled = false;
+        var itemId = GetItemIdFromSession(sessionId);
 
         try
         {
             httpClient = new HttpClient();
-            httpClient.Timeout = TimeSpan.FromHours(2); // MARK: Longer timeout for movies
+            httpClient.Timeout = TimeSpan.FromHours(2);
 
             var requestMessage = new HttpRequestMessage(HttpMethod.Get, streamInfo.Url);
 
@@ -515,16 +579,15 @@ public class StreamingService
                 streamInfo,
                 sessionId);
 
-            var playedDuration = DateTime.UtcNow - startTime;
-            var finalPosition = CalculateFinalPosition(sessionId, totalBytesStreamed, streamInfo, playedDuration);
+            // MARK: Normal completion - mark as watched if threshold met
+            var finalPosition = GetCurrentSessionPosition(sessionId);
+            var watchThreshold = TimeConversionUtil.GetWatchedThreshold(streamInfo.DurationTicks);
+            var shouldMarkWatched = finalPosition >= watchThreshold && watchThreshold > 0;
 
-            if (sessionId != null)
+            if (!string.IsNullOrEmpty(sessionId) && itemId.HasValue)
             {
-                var watchThreshold = TimeConversionUtil.GetWatchedThreshold(streamInfo.DurationTicks);
-                var shouldMarkWatched = finalPosition >= watchThreshold && watchThreshold > 0;
-
-                await _playbackReportingService.StopPlaybackAsync(sessionId, finalPosition, shouldMarkWatched);
-                _streamProgress.Remove(sessionId);
+                await CleanupSession(sessionId, itemId.Value, shouldMarkWatched, finalPosition);
+                sessionHandled = true;
 
                 _logger.LogInformation("STREAM COMPLETE: Session {SessionId} finished at {Position}ms, watched: {Watched}",
                     sessionId, TimeConversionUtil.TicksToMilliseconds(finalPosition), shouldMarkWatched);
@@ -532,50 +595,57 @@ public class StreamingService
         }
         catch (Exception ex) when (ex is IOException || ex is HttpListenerException)
         {
+            if (sessionHandled) return; // Avoid double handling
+
             var playedDuration = DateTime.UtcNow - startTime;
-            var finalPosition = CalculateFinalPosition(sessionId, totalBytesStreamed, streamInfo, playedDuration);
+            var finalPosition = GetCurrentSessionPosition(sessionId);
 
-            if (sessionId != null)
+            // MARK: More lenient handling for VLC
+            var isVLC = context.Request.UserAgent?.Contains("VLC", StringComparison.OrdinalIgnoreCase) == true;
+            var hasSignificantData = totalBytesStreamed > (isVLC ? 512 * 1024 : 2 * 1024 * 1024); // Lower threshold for VLC
+            var hasPlayedForAwhile = playedDuration.TotalSeconds > (isVLC ? 5 : 10); // Lower threshold for VLC
+            var notAtEnd = finalPosition < streamInfo.DurationTicks * 0.95; // Not in last 5%
+            var connectionLostGracefully = ex.Message.Contains("Broken pipe") || 
+                                        ex.Message.Contains("connection was closed") ||
+                                        ex.Message.Contains("remote host closed") ||
+                                        ex.Message.Contains("aborted") ||
+                                        ex.Message.Contains("canceled");
+
+            var isLikelyPause = hasSignificantData && hasPlayedForAwhile && notAtEnd && connectionLostGracefully;
+            
+            if (isLikelyPause && !isVLC) // Don't try to detect pauses for VLC
             {
-                // MARK: Enhanced pause detection logic
-                var hasSignificantData = totalBytesStreamed > 2 * 1024 * 1024; // 2MB threshold
-                var hasPlayedForAwhile = playedDuration.TotalSeconds > 15;
-                var notAtEnd = finalPosition < streamInfo.DurationTicks * 0.95; // Not in last 5%
-                var connectionLostGracefully = ex.Message.Contains("Broken pipe") || 
-                                            ex.Message.Contains("connection was closed") ||
-                                            ex.Message.Contains("remote host closed");
-
-                var isLikelyPause = hasSignificantData && hasPlayedForAwhile && notAtEnd && connectionLostGracefully;
+                _logger.LogInformation("PAUSE DETECTED: Session {SessionId} likely paused at {Position}ms (streamed {MB}MB, played {Duration}s)",
+                    sessionId, TimeConversionUtil.TicksToMilliseconds(finalPosition), 
+                    totalBytesStreamed / 1024.0 / 1024.0, playedDuration.TotalSeconds);
+                    
+                await _playbackReportingService.PausePlaybackAsync(sessionId, finalPosition);
+                // MARK: Keep session alive for pause, don't cleanup
+            }
+            else
+            {
+                _logger.LogInformation("STREAM ENDED: Session {SessionId} ended at {Position}ms (streamed {MB}MB, played {Duration}s)",
+                    sessionId, TimeConversionUtil.TicksToMilliseconds(finalPosition),
+                    totalBytesStreamed / 1024.0 / 1024.0, playedDuration.TotalSeconds);
                 
-                if (isLikelyPause)
+                if (!string.IsNullOrEmpty(sessionId) && itemId.HasValue)
                 {
-                    _logger.LogInformation("PAUSE DETECTED: Session {SessionId} likely paused at {Position}ms (streamed {MB}MB, played {Duration}s)",
-                        sessionId, TimeConversionUtil.TicksToMilliseconds(finalPosition), 
-                        totalBytesStreamed / 1024.0 / 1024.0, playedDuration.TotalSeconds);
-                        
-                    await _playbackReportingService.PausePlaybackAsync(sessionId, finalPosition);
-                    // MARK: Keep session alive for pause, don't remove from _streamProgress
-                }
-                else
-                {
-                    _logger.LogInformation("STREAM ENDED: Session {SessionId} ended at {Position}ms (streamed {MB}MB, played {Duration}s)",
-                        sessionId, TimeConversionUtil.TicksToMilliseconds(finalPosition),
-                        totalBytesStreamed / 1024.0 / 1024.0, playedDuration.TotalSeconds);
-                        
-                    await _playbackReportingService.StopPlaybackAsync(sessionId, finalPosition, markAsWatched: false);
-                    _streamProgress.Remove(sessionId);
+                    await CleanupSession(sessionId, itemId.Value, markAsWatched: false, finalPosition);
                 }
             }
+            sessionHandled = true;
         }
         catch (Exception ex)
         {
+            if (sessionHandled) return; // Avoid double handling
+
             _logger.LogError(ex, "Error during streaming");
 
-            if (sessionId != null)
+            if (!string.IsNullOrEmpty(sessionId) && itemId.HasValue)
             {
-                await _playbackReportingService.StopPlaybackAsync(sessionId, markAsWatched: false);
-                _streamProgress.Remove(sessionId);
+                await CleanupSession(sessionId, itemId.Value, markAsWatched: false);
             }
+            sessionHandled = true;
 
             await SendErrorResponse(context, HttpStatusCode.InternalServerError, "Stream error");
         }
@@ -594,17 +664,36 @@ public class StreamingService
         }
     }
 
+    // MARK: GetItemIdFromSession
+    private Guid? GetItemIdFromSession(string sessionId)
+    {
+        if (string.IsNullOrEmpty(sessionId)) return null;
+        
+        lock (_sessionLock)
+        {
+            var kvp = _itemToSessionMap.FirstOrDefault(kvp => kvp.Value == sessionId);
+            return kvp.Key == Guid.Empty ? null : kvp.Key;
+        }
+    }
+
+    // MARK: GetCurrentSessionPosition
+    private long GetCurrentSessionPosition(string sessionId)
+    {
+        if (_streamProgress.TryGetValue(sessionId, out var progress))
+        {
+            return progress.CurrentTicks;
+        }
+        return 0;
+    }
+
     // MARK: CopyStreamWithProgressAsync
-    private async Task<long> CopyStreamWithProgressAsync(Stream source, Stream destination, StreamInfo streamInfo, string? sessionId)
+    private async Task<long> CopyStreamWithProgressAsync(Stream source, Stream destination, StreamInfo streamInfo, string sessionId)
     {
         const int bufferSize = 131072; // 128KB buffer
         var buffer = new byte[bufferSize];
         long totalBytes = 0;
         var streamStartTime = DateTime.UtcNow;
         var lastProgressReport = streamStartTime;
-        var lastLogTime = streamStartTime;
-        var lastDataTime = streamStartTime; // Track when we last received data
-        var progressIncrement = TimeConversionUtil.SecondsToTicks(2); // 2 second increments
 
         try
         {
@@ -617,11 +706,10 @@ public class StreamingService
                 await destination.FlushAsync();
 
                 totalBytes += bytesRead;
-                lastDataTime = DateTime.UtcNow; // Update data timestamp
                 var now = DateTime.UtcNow;
 
                 // MARK: Conservative progress tracking with fixed increments
-                if (sessionId != null && _streamProgress.TryGetValue(sessionId, out var progress))
+                if (_streamProgress.TryGetValue(sessionId, out var progress))
                 {
                     var timeSinceLastUpdate = now - progress.LastUpdateTime;
                     
@@ -653,15 +741,6 @@ public class StreamingService
                             sessionId, TimeConversionUtil.TicksToMilliseconds(progress.CurrentTicks));
                     }
                 }
-
-                if ((now - lastLogTime).TotalSeconds >= 30)
-                {
-                    var elapsed = now - streamStartTime;
-                    var avgSpeed = totalBytes / elapsed.TotalSeconds / 1024 / 1024;
-                    _logger.LogDebug("Streaming: {TotalMB:F1} MB, speed: {Speed:F1} MB/s",
-                        totalBytes / 1024.0 / 1024.0, avgSpeed);
-                    lastLogTime = now;
-                }
             }
 
             return totalBytes;
@@ -671,37 +750,6 @@ public class StreamingService
             _logger.LogInformation("Stream interrupted after {TotalMB:F1} MB", totalBytes / 1024.0 / 1024.0);
             throw;
         }
-    }
-
-    // MARK: CalculateFinalPosition
-    private long CalculateFinalPosition(string? sessionId, long bytesStreamed, StreamInfo streamInfo, TimeSpan playedDuration)
-    {
-        if (sessionId != null && _streamProgress.TryGetValue(sessionId, out var progress))
-        {
-            // MARK: Use tracked position, but validate it's reasonable
-            var trackedPosition = progress.CurrentTicks;
-            
-            // MARK: Sanity check - don't let it exceed what's reasonable for the time played
-            var maxReasonablePosition = progress.StartTime == DateTime.MinValue ? 
-                (long)(playedDuration.Ticks * 1.2) : // 20% buffer for initial streams
-                progress.CurrentTicks; // Trust tracked position for ongoing streams
-            
-            var finalPosition = Math.Min(trackedPosition, Math.Min(maxReasonablePosition, streamInfo.DurationTicks));
-            
-            _logger.LogDebug("FINAL POSITION: Tracked={TrackedMs}ms, MaxReasonable={MaxMs}ms, Final={FinalMs}ms", 
-                TimeConversionUtil.TicksToMilliseconds(trackedPosition),
-                TimeConversionUtil.TicksToMilliseconds(maxReasonablePosition),
-                TimeConversionUtil.TicksToMilliseconds(finalPosition));
-            
-            return finalPosition;
-        }
-
-        // MARK: Fallback - very conservative estimate
-        if (playedDuration.TotalSeconds < 5)
-            return 0;
-
-        var conservativePosition = (long)(playedDuration.Ticks * 0.5); // Even more conservative
-        return Math.Min(conservativePosition, streamInfo.DurationTicks);
     }
 
     // MARK: SendErrorResponse

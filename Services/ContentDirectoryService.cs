@@ -93,7 +93,17 @@ public class ContentDirectoryService
             _logger.LogDebug("Browse request: ObjectID={ObjectId}, Flag={Flag}, Start={Start}, Count={Count}",
                 objectId, browseFlag, startingIndex, requestedCount);
 
-            var result = await ProcessBrowseAsync(objectId, browseFlag, startingIndex, requestedCount, userAgent);
+            BrowseResult result;
+            
+            // MARK: Handle BrowseMetadata differently for Samsung TVs
+            if (browseFlag == "BrowseMetadata")
+            {
+                result = await ProcessBrowseMetadataAsync(objectId, userAgent);
+            }
+            else
+            {
+                result = await ProcessBrowseAsync(objectId, browseFlag, startingIndex, requestedCount, userAgent);
+            }
 
             return CreateBrowseResponse(result.DidlXml, result.NumberReturned, result.TotalMatches);
         }
@@ -102,6 +112,103 @@ public class ContentDirectoryService
             _logger.LogError(ex, "Error processing browse request");
             return CreateSoapFault("Internal server error");
         }
+    }
+
+    // MARK: ProcessBrowseMetadataAsync
+    private async Task<BrowseResult> ProcessBrowseMetadataAsync(string objectId, string? userAgent)
+    {
+        _logger.LogInformation("Processing BrowseMetadata for ObjectID: {ObjectId}", objectId);
+        
+        if (objectId == "0")
+        {
+            // MARK: For root metadata, return the MediaServer container itself
+            var rootContainer = CreateContainerXml(
+                "0",
+                "-1",
+                "FinDLNA Media Server",
+                "object.container.storageFolder",
+                await GetRootChildCountAsync(),
+                null
+            );
+            
+            var didlXml = CreateDidlXml(rootContainer);
+            return new BrowseResult { DidlXml = didlXml, NumberReturned = 1, TotalMatches = 1 };
+        }
+
+        // MARK: For other items, try to get their metadata
+        if (objectId.StartsWith("library:"))
+        {
+            var libraryId = objectId.Substring(8);
+            if (Guid.TryParse(libraryId, out var libGuid))
+            {
+                var libraries = await _jellyfinService.GetLibraryFoldersAsync();
+                var library = libraries?.FirstOrDefault(l => l.Id == libGuid);
+                
+                if (library != null)
+                {
+                    var container = CreateContainerXml(
+                        objectId,
+                        "0",
+                        library.Name ?? "Unknown",
+                        "object.container.storageFolder",
+                        library.ChildCount ?? 0,
+                        library.Id
+                    );
+                    
+                    var didlXml = CreateDidlXml(container);
+                    return new BrowseResult { DidlXml = didlXml, NumberReturned = 1, TotalMatches = 1 };
+                }
+            }
+        }
+
+        if (Guid.TryParse(objectId, out var itemGuid))
+        {
+            var item = await _jellyfinService.GetItemAsync(itemGuid);
+            if (item != null)
+            {
+                string xml;
+                if (ContainerTypes.Contains(item.Type ?? BaseItemDto_Type.Folder))
+                {
+                    xml = CreateContainerXml(
+                        objectId,
+                        GetParentId(item),
+                        item.Name ?? "Unknown",
+                        GetUpnpClass(item.Type ?? BaseItemDto_Type.Folder),
+                        item.ChildCount ?? 0,
+                        item.Id
+                    );
+                }
+                else
+                {
+                    xml = CreateItemXml(item, GetParentId(item));
+                }
+                
+                var didlXml = CreateDidlXml(xml);
+                return new BrowseResult { DidlXml = didlXml, NumberReturned = 1, TotalMatches = 1 };
+            }
+        }
+
+        // MARK: Fallback for unknown items
+        var didlEmpty = CreateDidlXml("");
+        return new BrowseResult { DidlXml = didlEmpty, NumberReturned = 0, TotalMatches = 0 };
+    }
+
+    // MARK: GetParentId
+    private string GetParentId(BaseItemDto item)
+    {
+        // MARK: Determine parent ID based on item structure
+        if (item.ParentId.HasValue)
+        {
+            return item.ParentId.Value.ToString();
+        }
+        return "0";
+    }
+
+    // MARK: GetRootChildCountAsync
+    private async Task<int> GetRootChildCountAsync()
+    {
+        var libraries = await _jellyfinService.GetLibraryFoldersAsync();
+        return libraries?.Count ?? 0;
     }
 
     // MARK: ProcessBrowseAsync
@@ -367,21 +474,25 @@ public class ContentDirectoryService
         var bitrate = mediaSource?.Bitrate ?? 8000000;
         var bitrateAttr = $" bitrate=\"{bitrate}\"";
         
+        var attributes = $"{sizeAttr}{durationAttr}{resolutionAttr}{bitrateAttr}";
+        
         _logger.LogInformation("Creating DLNA item: {Title} (Duration: {Duration}, Size: {Size} bytes, Bitrate: {Bitrate})", 
             title, duration, size, bitrate);
         
         var dlnaFlags = "DLNA.ORG_PN=AVC_MP4_MP_HD_1080i_AAC;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000";
         var protocolInfo = $"http-get:*:{mimeType}:{dlnaFlags}";
         
-        return $"""
-            <item id="{item.Id.Value}" parentID="{parentId}" restricted="1">
-                <dc:title>{title}</dc:title>
-                <dc:date>{DateTime.UtcNow:yyyy-MM-dd}</dc:date>
-                <upnp:class>{upnpClass}</upnp:class>
-                {albumArtXml}
-                <res protocolInfo="{protocolInfo}"{sizeAttr}{durationAttr}{resolutionAttr}{bitrateAttr}>{streamUrl}</res>
-            </item>
-            """;
+        return _xmlTemplateService.GetTemplate("ItemTemplate",
+            item.Id.Value,           // {0} - id
+            parentId,                // {1} - parentID
+            title,                   // {2} - title
+            DateTime.UtcNow.ToString("yyyy-MM-dd"), // {3} - date
+            upnpClass,               // {4} - upnp:class
+            albumArtXml,             // {5} - album art
+            protocolInfo,            // {6} - protocolInfo
+            attributes,              // {7} - res attributes
+            streamUrl                // {8} - stream URL
+        );
     }
 
     // MARK: FormatDurationForDlna
@@ -448,13 +559,14 @@ public class ContentDirectoryService
         var albumArtXml = !string.IsNullOrEmpty(albumArtUrl) ?
             $"<upnp:albumArtURI>{albumArtUrl}</upnp:albumArtURI>" : "";
 
-        return $"""
-            <container id="{id}" parentID="{parentId}" restricted="1" childCount="{childCount}">
-                <dc:title>{escapedTitle}</dc:title>
-                <upnp:class>{upnpClass}</upnp:class>
-                {albumArtXml}
-            </container>
-            """;
+        return _xmlTemplateService.GetTemplate("ContainerTemplate",
+            id,              // {0} - id
+            parentId,        // {1} - parentID
+            childCount,      // {2} - childCount
+            escapedTitle,    // {3} - title
+            upnpClass,       // {4} - upnp:class
+            albumArtXml      // {5} - album art
+        );
     }
 
     // MARK: GetAlbumArtUrl
@@ -477,37 +589,10 @@ public class ContentDirectoryService
         return "";
     }
 
-    // MARK: EstimateTranscodedSize
-    private long EstimateTranscodedSize(long? runTimeTicks, int? bitrate)
-    {
-        if (!runTimeTicks.HasValue || runTimeTicks.Value <= 0)
-            return 0;
-
-        // Use original bitrate if available, otherwise estimate
-        var estimatedBitrate = bitrate ?? 8000000; // 8 Mbps default for HD content
-        
-        // For fMP4 transcoding, use a conservative estimate (slightly lower than target bitrate)
-        var transcodeBitrate = Math.Min(estimatedBitrate, 8000000); // Cap at 8 Mbps
-        
-        var durationSeconds = TimeConversionUtil.TicksToSeconds(runTimeTicks.Value);
-        var estimatedBytes = (long)(durationSeconds * transcodeBitrate / 8); // Convert bits to bytes
-        
-        _logger.LogDebug("Estimated transcoded size: {EstimatedMB}MB for {DurationMinutes}min at {BitrateMbps}Mbps", 
-            estimatedBytes / 1024.0 / 1024.0, durationSeconds / 60.0, transcodeBitrate / 1024.0 / 1024.0);
-        
-        return estimatedBytes;
-    }
-
     // MARK: CreateDidlXml
     private string CreateDidlXml(string content)
     {
-        return $"""
-            <DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" 
-                       xmlns:dc="http://purl.org/dc/elements/1.1/" 
-                       xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
-                {content}
-            </DIDL-Lite>
-            """;
+        return _xmlTemplateService.GetTemplate("DidlLiteTemplate", content);
     }
 
     // MARK: GetUpnpClass
@@ -534,29 +619,12 @@ public class ContentDirectoryService
     // MARK: GetMimeTypeFromItem
     private string GetMimeTypeFromItem(BaseItemDto item)
     {
-        return "video/mp4";
-    }
-
-    // MARK: FormatDuration
-    private string FormatDuration(long? runTimeTicks)
-    {
-        if (!runTimeTicks.HasValue || runTimeTicks.Value <= 0)
-            return "0:00:00.000";
-
-        var timeSpan = TimeSpan.FromTicks(runTimeTicks.Value);
-
-        var hours = (int)timeSpan.TotalHours;
-        var minutes = timeSpan.Minutes;
-        var seconds = timeSpan.Seconds;
-        var milliseconds = timeSpan.Milliseconds;
-
-        // Use standard format that most DLNA clients expect
-        var formattedDuration = $"{hours}:{minutes:00}:{seconds:00}.{milliseconds:000}";
-
-        _logger.LogDebug("Formatted duration for DLNA: {RunTimeTicks} ticks ({TotalSeconds}s) -> {FormattedDuration}",
-            runTimeTicks.Value, timeSpan.TotalSeconds, formattedDuration);
-
-        return formattedDuration;
+        return item.Type switch
+        {
+            BaseItemDto_Type.Audio => "audio/mpeg",
+            BaseItemDto_Type.Photo => "image/jpeg",
+            _ => "video/mp4"
+        };
     }
 
     // MARK: ProcessSearchCapabilitiesRequest

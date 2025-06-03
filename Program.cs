@@ -41,7 +41,6 @@ builder.Services.AddSingleton(sp =>
 
 builder.Services.AddSingleton<IAuthenticationProvider, AnonymousAuthenticationProvider>();
 builder.Services.AddSingleton<JellyfinRequestAdapter>();
-builder.Services.AddSingleton<XmlTemplateService>();
 
 builder.Services.AddSingleton<JellyfinApiClient>(sp =>
 {
@@ -67,11 +66,12 @@ builder.Services.AddSingleton<JellyfinApiClient>(sp =>
     return client;
 });
 
-// MARK: Service registration
+// MARK: Service registration - ORDER MATTERS!
+builder.Services.AddSingleton<XmlTemplateService>(); // MARK: Must be registered first
 builder.Services.AddScoped<DeviceProfileService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<JellyfinService>();
-builder.Services.AddSingleton<SsdpService>();
+builder.Services.AddSingleton<SsdpService>(); // MARK: Now depends on XmlTemplateService
 builder.Services.AddScoped<ContentDirectoryService>();
 builder.Services.AddSingleton<PlaybackReportingService>();
 builder.Services.AddSingleton<StreamingService>();

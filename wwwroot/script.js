@@ -86,14 +86,86 @@ document.addEventListener('DOMContentLoaded', function() {
                 <span>Running</span>
                 </div>
             </div>
-            <button id="reconfigureBtn" class="reconfigure-btn">Reconfigure</button>
+            <div class="button-group">
+                <button id="refreshSsdpBtn" class="action-btn">Refresh SSDP</button>
+                <button id="restartDlnaBtn" class="action-btn">Restart DLNA</button>
+                <button id="reconfigureBtn" class="reconfigure-btn">Reconfigure</button>
+            </div>
         `;
+        
+        document.getElementById('refreshSsdpBtn').addEventListener('click', async function() {
+            await refreshSsdp();
+        });
+        
+        document.getElementById('restartDlnaBtn').addEventListener('click', async function() {
+            await restartDlna();
+        });
         
         document.getElementById('reconfigureBtn').addEventListener('click', function() {
             if (confirm('Reset configuration and reconnect?')) {
                 showLoginForm();
             }
         });
+    }
+
+    // MARK: refreshSsdp
+    async function refreshSsdp() {
+        const btn = document.getElementById('refreshSsdpBtn');
+        const originalText = btn.textContent;
+        
+        try {
+            btn.disabled = true;
+            btn.textContent = 'Refreshing...';
+            
+            const response = await fetch('/api/refresh/ssdp', { method: 'POST' });
+            const result = await response.json();
+            
+            if (result.success) {
+                btn.textContent = 'Success!';
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.disabled = false;
+                }, 2000);
+            } else {
+                throw new Error(result.error || 'Unknown error');
+            }
+        } catch (error) {
+            btn.textContent = 'Failed';
+            setTimeout(() => {
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }, 2000);
+        }
+    }
+
+    // MARK: restartDlna
+    async function restartDlna() {
+        const btn = document.getElementById('restartDlnaBtn');
+        const originalText = btn.textContent;
+        
+        try {
+            btn.disabled = true;
+            btn.textContent = 'Restarting...';
+            
+            const response = await fetch('/api/refresh/dlna', { method: 'POST' });
+            const result = await response.json();
+            
+            if (result.success) {
+                btn.textContent = 'Success!';
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.disabled = false;
+                }, 3000);
+            } else {
+                throw new Error(result.error || 'Unknown error');
+            }
+        } catch (error) {
+            btn.textContent = 'Failed';
+            setTimeout(() => {
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }, 2000);
+        }
     }
     
     // MARK: showLoginForm
