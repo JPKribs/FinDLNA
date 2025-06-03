@@ -52,6 +52,8 @@ public class PlaybackReportingService
                 return null;
             }
 
+            var actualStartPosition = startPositionTicks ?? 0L;
+            
             var playbackStartInfo = new
             {
                 UserId = userId,
@@ -63,17 +65,20 @@ public class PlaybackReportingService
                 IsPaused = false,
                 RepeatMode = "RepeatNone",
                 MaxStreamingBitrate = 120000000,
-                StartTimeTicks = startPositionTicks ?? 0L,
+                StartTimeTicks = actualStartPosition,
+                PositionTicks = actualStartPosition, // MARK: Also set current position
                 VolumeLevel = 100,
                 Brightness = 100,
                 AspectRatio = "16:9",
-                PlayMethod = "DirectPlay",
+                PlayMethod = startPositionTicks.HasValue ? "Transcode" : "DirectPlay",
                 PlaySessionId = sessionId,
                 PlaylistItemId = sessionId,
                 MediaStreams = new object[0],
                 PlaybackStartTimeTicks = DateTimeOffset.UtcNow.Ticks,
                 SubtitleStreamIndex = (int?)null,
-                AudioStreamIndex = (int?)null
+                AudioStreamIndex = (int?)null,
+                LiveStreamId = (string?)null,
+                EventName = "playbackstart"
             };
 
             var json = JsonSerializer.Serialize(playbackStartInfo);
@@ -82,6 +87,8 @@ public class PlaybackReportingService
             var url = $"{serverUrl}/Sessions/Playing";
             var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
             request.Headers.Add("X-Emby-Token", accessToken);
+
+            _logger.LogDebug("PLAYBACK START REQUEST: {Json}", json);
 
             var response = await _httpClient.SendAsync(request);
 
@@ -96,13 +103,13 @@ public class PlaybackReportingService
                     UserAgent = userAgent ?? "Unknown",
                     ClientEndpoint = clientEndpoint ?? "Unknown",
                     LastProgressUpdate = DateTimeOffset.UtcNow,
-                    LastPositionTicks = startPositionTicks ?? 0L
+                    LastPositionTicks = actualStartPosition
                 };
 
                 _activeSessions[sessionId] = session;
 
-                _logger.LogInformation("Started playback session {SessionId} for item {ItemId} from {ClientEndpoint} at position {Position}ms", 
-                    sessionId, itemId, clientEndpoint, TimeConversionUtil.TicksToMilliseconds(startPositionTicks ?? 0));
+                _logger.LogInformation("PLAYBACK STARTED: Session {SessionId} for item {ItemId} at position {Position}ms from {Client}", 
+                    sessionId, itemId, TimeConversionUtil.TicksToMilliseconds(actualStartPosition), clientEndpoint);
 
                 return sessionId;
             }
@@ -128,7 +135,7 @@ public class PlaybackReportingService
         {
             if (!_activeSessions.TryGetValue(sessionId, out var session))
             {
-                _logger.LogDebug("Session {SessionId} not found for progress update (may have been stopped)", sessionId);
+                _logger.LogDebug("Session {SessionId} not found for progress update", sessionId);
                 return;
             }
 
@@ -156,7 +163,8 @@ public class PlaybackReportingService
                 PlayMethod = "DirectPlay",
                 PlaySessionId = session.SessionId,
                 PlaylistItemId = session.SessionId,
-                EventName = isPaused ? "pause" : "timeupdate"
+                EventName = isPaused ? "pause" : "timeupdate",
+                LiveStreamId = (string?)null
             };
 
             var json = JsonSerializer.Serialize(progressInfo);
@@ -166,6 +174,8 @@ public class PlaybackReportingService
             var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
             request.Headers.Add("X-Emby-Token", accessToken);
 
+            _logger.LogDebug("PROGRESS UPDATE: {Json}", json);
+
             var response = await _httpClient.SendAsync(request);
 
             if (response.IsSuccessStatusCode)
@@ -174,7 +184,7 @@ public class PlaybackReportingService
                 session.LastPositionTicks = positionTicks;
                 session.IsPaused = isPaused;
 
-                _logger.LogDebug("Updated playback progress for session {SessionId}: {Position}ms, paused: {IsPaused}", 
+                _logger.LogDebug("PROGRESS UPDATED: Session {SessionId} at {Position}ms, paused: {IsPaused}", 
                     sessionId, TimeConversionUtil.TicksToMilliseconds(positionTicks), isPaused);
             }
             else
@@ -251,7 +261,9 @@ public class PlaybackReportingService
                 PlaySessionId = session.SessionId,
                 PlaylistItemId = session.SessionId,
                 Failed = false,
-                NextMediaType = "Unknown"
+                NextMediaType = "Unknown",
+                PlayMethod = "DirectPlay",
+                LiveStreamId = (string?)null
             };
 
             var json = JsonSerializer.Serialize(stopInfo);
@@ -261,11 +273,13 @@ public class PlaybackReportingService
             var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
             request.Headers.Add("X-Emby-Token", accessToken);
 
+            _logger.LogDebug("PLAYBACK STOP REQUEST: {Json}", json);
+
             var response = await _httpClient.SendAsync(request);
 
             if (response.IsSuccessStatusCode)
             {
-                _logger.LogInformation("Stopped playback session {SessionId} for item {ItemId} - Duration: {Duration}, Final Position: {Position}ms, Client: {Client}", 
+                _logger.LogInformation("PLAYBACK STOPPED: Session {SessionId} for item {ItemId} - Duration: {Duration}, Final Position: {Position}ms, Client: {Client}", 
                     sessionId, session.ItemId, playedDuration, TimeConversionUtil.TicksToMilliseconds(positionTicks), session.ClientEndpoint);
 
                 if (markAsWatched)

@@ -40,3 +40,11 @@ public class PlaybackSession
     public string UserAgent { get; set; } = string.Empty;
     public string ClientEndpoint { get; set; } = string.Empty;
 }
+
+// MARK: StreamProgress
+public class StreamProgress
+{
+    public long CurrentTicks { get; set; }
+    public DateTime StartTime { get; set; }
+    public DateTime LastUpdateTime { get; set; }
+}

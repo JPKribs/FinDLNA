@@ -344,12 +344,10 @@ public class ContentDirectoryService
             return "";
         }
 
-        _logger.LogDebug("Generated proxy stream URL for item {ItemId}: {StreamUrl}", item.Id.Value, streamUrl);
-
         var mimeType = GetMimeTypeFromItem(item);
         var upnpClass = GetUpnpClass(item.Type ?? BaseItemDto_Type.Video);
-        var duration = FormatDuration(runTimeTicks);
-        var size = mediaSource?.Size ?? 0;
+        var duration = FormatDurationForDlna(runTimeTicks);
+        var size = EstimateFileSize(runTimeTicks);
         var resolution = GetResolution(item);
 
         var title = System.Security.SecurityElement.Escape(
@@ -357,26 +355,23 @@ public class ContentDirectoryService
                 ? $"{item.IndexNumber}. {item.Name ?? "Unknown"}" 
                 : item.Name ?? "Unknown"
         );
-        var albumArtUrl = GetAlbumArtUrl(item.Id.Value);
         
+        var albumArtUrl = GetAlbumArtUrl(item.Id.Value);
         var albumArtXml = !string.IsNullOrEmpty(albumArtUrl) ? 
             $"<upnp:albumArtURI>{albumArtUrl}</upnp:albumArtURI>" : "";
         
         var resolutionAttr = !string.IsNullOrEmpty(resolution) ? $" resolution=\"{resolution}\"" : "";
-        var durationAttr = !string.IsNullOrEmpty(duration) && duration != "0:00:00.000" ? $" duration=\"{duration}\"" : "";
+        var durationAttr = !string.IsNullOrEmpty(duration) ? $" duration=\"{duration}\"" : "";
+        var sizeAttr = size > 0 ? $" size=\"{size}\"" : "";
         
-        var bitrate = mediaSource?.Bitrate;
-        var bitrateAttr = bitrate.HasValue ? $" bitrate=\"{bitrate.Value}\"" : "";
+        var bitrate = mediaSource?.Bitrate ?? 8000000;
+        var bitrateAttr = $" bitrate=\"{bitrate}\"";
         
-        // Add size estimate for fMP4 streams to help with duration calculation
-        var estimatedSize = EstimateTranscodedSize(runTimeTicks, bitrate);
-        var sizeAttr = estimatedSize > 0 ? $" size=\"{estimatedSize}\"" : "";
-        
-        _logger.LogInformation("Creating fMP4 media item XML: {Title} (Duration: {Duration}, Original Size: {Size}, Estimated Size: {EstimatedSize}, Bitrate: {Bitrate})", 
-            title, duration, size, estimatedSize, bitrate);
+        _logger.LogInformation("Creating DLNA item: {Title} (Duration: {Duration}, Size: {Size} bytes, Bitrate: {Bitrate})", 
+            title, duration, size, bitrate);
         
         var dlnaFlags = "DLNA.ORG_PN=AVC_MP4_MP_HD_1080i_AAC;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000";
-        var mainResource = $"<res protocolInfo=\"http-get:*:{mimeType}:{dlnaFlags}\"{sizeAttr}{durationAttr}{resolutionAttr}{bitrateAttr}>{streamUrl}</res>";
+        var protocolInfo = $"http-get:*:{mimeType}:{dlnaFlags}";
         
         return $"""
             <item id="{item.Id.Value}" parentID="{parentId}" restricted="1">
@@ -384,9 +379,30 @@ public class ContentDirectoryService
                 <dc:date>{DateTime.UtcNow:yyyy-MM-dd}</dc:date>
                 <upnp:class>{upnpClass}</upnp:class>
                 {albumArtXml}
-                {mainResource}
+                <res protocolInfo="{protocolInfo}"{sizeAttr}{durationAttr}{resolutionAttr}{bitrateAttr}>{streamUrl}</res>
             </item>
             """;
+    }
+
+    // MARK: FormatDurationForDlna
+    private string FormatDurationForDlna(long? runTimeTicks)
+    {
+        if (!runTimeTicks.HasValue || runTimeTicks.Value <= 0)
+            return "0:00:00.000";
+
+        var timeSpan = TimeSpan.FromTicks(runTimeTicks.Value);
+        return $"{(int)timeSpan.TotalHours}:{timeSpan.Minutes:00}:{timeSpan.Seconds:00}.{timeSpan.Milliseconds:000}";
+    }
+
+    // MARK: EstimateFileSize
+    private long EstimateFileSize(long? runTimeTicks)
+    {
+        if (!runTimeTicks.HasValue || runTimeTicks.Value <= 0)
+            return 0;
+
+        var durationSeconds = TimeConversionUtil.TicksToSeconds(runTimeTicks.Value);
+        var estimatedBitrate = 8000000; // 8 Mbps
+        return (long)(durationSeconds * estimatedBitrate / 8);
     }
 
     // MARK: GetProxyStreamUrl
