@@ -19,6 +19,16 @@ public class DlnaService : IDisposable
     private HttpListener? _httpListener;
     private bool _isRunning;
 
+    private static readonly HashSet<string> UnsupportedSubtitleCodecs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "pgs", "pgssub", "dvdsub", "dvbsub", "hdmv_pgs_subtitle", "presentation_graphics_stream"
+    };
+
+    private static readonly HashSet<string> SupportedSubtitleCodecs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "srt", "subrip", "ass", "ssa", "vtt", "webvtt", "sub", "idx"
+    };
+
     public DlnaService(
         ILogger<DlnaService> logger, 
         IConfiguration configuration,
@@ -96,7 +106,7 @@ public class DlnaService : IDisposable
         }
     }
 
-// MARK: HandleRequest
+    // MARK: HandleRequest
     private async Task HandleRequest(HttpListenerContext context)
     {
         var request = context.Request;
@@ -191,7 +201,6 @@ public class DlnaService : IDisposable
             _logger.LogInformation("SUBTITLE REQUEST: item {ItemId}, stream {StreamIndex} from {UserAgent}", 
                 itemId, streamIndex, context.Request.UserAgent);
 
-            // Get the item to check what subtitle streams are actually available
             var item = await _jellyfinService.GetItemAsync(itemId);
             if (item == null)
             {
@@ -201,48 +210,51 @@ public class DlnaService : IDisposable
                 return;
             }
 
-            // Log all available subtitle streams
             var mediaSource = item.MediaSources?.FirstOrDefault();
-            if (mediaSource?.MediaStreams != null)
+            if (mediaSource?.MediaStreams == null)
             {
-                var subtitleStreams = mediaSource.MediaStreams
-                    .Where(s => s.Type == MediaStream_Type.Subtitle)
-                    .ToList();
-
-                _logger.LogInformation("Available subtitle streams for item {ItemId} (Container: {Container}):", itemId, mediaSource.Container);
-                foreach (var stream in subtitleStreams)
-                {
-                    _logger.LogInformation("  Stream Index: {Index}, Language: {Language}, Codec: {Codec}, IsExternal: {IsExternal}", 
-                        stream.Index, stream.Language, stream.Codec, stream.IsExternal);
-                }
-
-                // Find the subtitle stream with the matching index
-                var requestedStream = subtitleStreams.FirstOrDefault(s => s.Index == streamIndex);
-                if (requestedStream == null)
-                {
-                    _logger.LogWarning("Requested subtitle stream index {StreamIndex} not found for item {ItemId}", streamIndex, itemId);
-                    context.Response.StatusCode = 404;
-                    context.Response.Close();
-                    return;
-                }
-
-                _logger.LogInformation("Processing subtitle stream: Index={Index}, Language={Language}, Codec={Codec}", 
-                    requestedStream.Index, requestedStream.Language, requestedStream.Codec);
+                _logger.LogWarning("No media streams found for item {ItemId}", itemId);
+                context.Response.StatusCode = 404;
+                context.Response.Close();
+                return;
             }
 
-            // For embedded subtitles (especially MKV), try multiple URL patterns
+            var subtitleStreams = mediaSource.MediaStreams
+                .Where(s => s.Type == MediaStream_Type.Subtitle)
+                .ToList();
+
+            _logger.LogInformation("Available subtitle streams for item {ItemId} (Container: {Container}):", itemId, mediaSource.Container);
+            foreach (var stream in subtitleStreams)
+            {
+                _logger.LogInformation("  Stream Index: {Index}, Language: {Language}, Codec: {Codec}, IsExternal: {IsExternal}", 
+                    stream.Index, stream.Language, stream.Codec, stream.IsExternal);
+            }
+
+            var requestedStream = subtitleStreams.FirstOrDefault(s => s.Index == streamIndex);
+            if (requestedStream == null)
+            {
+                _logger.LogWarning("Requested subtitle stream index {StreamIndex} not found for item {ItemId}", streamIndex, itemId);
+                context.Response.StatusCode = 404;
+                context.Response.Close();
+                return;
+            }
+
+            if (!IsSubtitleSupported(requestedStream.Codec))
+            {
+                _logger.LogWarning("Subtitle stream {StreamIndex} has unsupported codec {Codec} for item {ItemId}, returning fallback", 
+                    streamIndex, requestedStream.Codec, itemId);
+                await ReturnFallbackSubtitle(context);
+                return;
+            }
+
+            _logger.LogInformation("Processing supported subtitle stream: Index={Index}, Language={Language}, Codec={Codec}", 
+                requestedStream.Index, requestedStream.Language, requestedStream.Codec);
+
             var subtitleUrls = new[]
             {
-                // Pattern 1: /Videos/{id}/{streamIndex}/Subtitles.srt
                 $"{_configuration["Jellyfin:ServerUrl"]?.TrimEnd('/')}/Videos/{itemId}/{streamIndex}/Subtitles.srt?X-Emby-Token={_configuration["Jellyfin:AccessToken"]}",
-                
-                // Pattern 2: /Videos/{id}/Subtitles/{streamIndex}/Stream.srt
                 $"{_configuration["Jellyfin:ServerUrl"]?.TrimEnd('/')}/Videos/{itemId}/Subtitles/{streamIndex}/Stream.srt?X-Emby-Token={_configuration["Jellyfin:AccessToken"]}",
-                
-                // Pattern 3: /Videos/{id}/Subtitles/{streamIndex}
                 $"{_configuration["Jellyfin:ServerUrl"]?.TrimEnd('/')}/Videos/{itemId}/Subtitles/{streamIndex}?format=srt&X-Emby-Token={_configuration["Jellyfin:AccessToken"]}",
-                
-                // Pattern 4: Stream endpoint
                 $"{_configuration["Jellyfin:ServerUrl"]?.TrimEnd('/')}/Videos/{itemId}/stream?StreamIndex={streamIndex}&api_key={_configuration["Jellyfin:AccessToken"]}"
             };
 
@@ -260,7 +272,6 @@ public class DlnaService : IDisposable
                     {
                         var content = await response.Content.ReadAsByteArrayAsync();
                         
-                        // Check if we got actual subtitle content (not HTML error page)
                         var contentString = System.Text.Encoding.UTF8.GetString(content, 0, Math.Min(content.Length, 1000));
                         if (content.Length > 10 && !contentString.Contains("<html", StringComparison.OrdinalIgnoreCase))
                         {
@@ -295,13 +306,7 @@ public class DlnaService : IDisposable
             }
 
             _logger.LogWarning("All subtitle URL attempts failed for item {ItemId}, stream {StreamIndex}", itemId, streamIndex);
-            
-            // Return a simple "No subtitles available" message instead of 404
-            var fallbackContent = System.Text.Encoding.UTF8.GetBytes("1\n00:00:00,000 --> 00:00:01,000\n[No subtitles available]\n");
-            context.Response.ContentType = "text/srt";
-            context.Response.ContentLength64 = fallbackContent.Length;
-            await context.Response.OutputStream.WriteAsync(fallbackContent);
-            context.Response.Close();
+            await ReturnFallbackSubtitle(context);
         }
         catch (Exception ex)
         {
@@ -311,14 +316,41 @@ public class DlnaService : IDisposable
         }
     }
 
-    // MARK: GetAlternativeSubtitleUrl
-    private string GetAlternativeSubtitleUrl(Guid itemId, int streamIndex, string format)
+    // MARK: IsSubtitleSupported
+    private bool IsSubtitleSupported(string? codec)
     {
-        var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
-        var accessToken = _configuration["Jellyfin:AccessToken"];
+        if (string.IsNullOrEmpty(codec))
+        {
+            _logger.LogDebug("Subtitle stream has no codec information, treating as unsupported");
+            return false;
+        }
 
-        // Try the alternative subtitle endpoint format
-        return $"{serverUrl}/Items/{itemId}/Subtitles/{streamIndex}/Stream.{format}?X-Emby-Token={accessToken}";
+        var normalizedCodec = codec.ToLowerInvariant();
+
+        if (UnsupportedSubtitleCodecs.Contains(normalizedCodec))
+        {
+            _logger.LogDebug("Subtitle codec {Codec} is explicitly unsupported", codec);
+            return false;
+        }
+
+        if (SupportedSubtitleCodecs.Contains(normalizedCodec))
+        {
+            _logger.LogDebug("Subtitle codec {Codec} is explicitly supported", codec);
+            return true;
+        }
+
+        _logger.LogDebug("Unknown subtitle codec {Codec}, treating as supported for conversion attempt", codec);
+        return true;
+    }
+
+    // MARK: ReturnFallbackSubtitle
+    private async Task ReturnFallbackSubtitle(HttpListenerContext context)
+    {
+        var fallbackContent = System.Text.Encoding.UTF8.GetBytes("1\n00:00:00,000 --> 00:00:01,000\n[No subtitles available]\n");
+        context.Response.ContentType = "text/srt";
+        context.Response.ContentLength64 = fallbackContent.Length;
+        await context.Response.OutputStream.WriteAsync(fallbackContent);
+        context.Response.Close();
     }
 
     // MARK: HandleDeviceDescription

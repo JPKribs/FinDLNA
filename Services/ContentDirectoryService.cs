@@ -49,6 +49,16 @@ public class ContentDirectoryService
         BaseItemDto_Type.AudioBook
     };
 
+    private static readonly HashSet<string> UnsupportedSubtitleCodecs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "pgs", "pgssub", "dvdsub", "dvbsub", "hdmv_pgs_subtitle", "presentation_graphics_stream"
+    };
+
+    private static readonly HashSet<string> SupportedSubtitleCodecs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "srt", "subrip", "ass", "ssa", "vtt", "webvtt", "sub", "idx"
+    };
+
     public ContentDirectoryService(
         ILogger<ContentDirectoryService> logger,
         JellyfinService jellyfinService,
@@ -327,23 +337,23 @@ public class ContentDirectoryService
             return "";
         }
 
-        // Get duration from multiple sources
         var runTimeTicks = item.RunTimeTicks;
         var mediaSource = item.MediaSources?.FirstOrDefault();
         
-        // Try to get duration from media source if main item doesn't have it
         if ((!runTimeTicks.HasValue || runTimeTicks.Value == 0) && mediaSource?.RunTimeTicks.HasValue == true)
         {
             runTimeTicks = mediaSource.RunTimeTicks;
             _logger.LogDebug("Using media source duration for item {ItemId}: {Duration} ticks", item.Id.Value, runTimeTicks);
         }
 
-        var streamUrl = _jellyfinService.GetStreamUrlAsync(item.Id.Value, mediaSource?.Container);
+        var streamUrl = GetProxyStreamUrl(item.Id.Value);
         if (string.IsNullOrEmpty(streamUrl))
         {
             _logger.LogWarning("CreateItemXml: No stream URL for item {ItemId}", item.Id.Value);
             return "";
         }
+
+        _logger.LogDebug("Generated proxy stream URL for item {ItemId}: {StreamUrl}", item.Id.Value, streamUrl);
 
         var mimeType = GetMimeTypeFromItem(item);
         var upnpClass = GetUpnpClass(item.Type ?? BaseItemDto_Type.Video);
@@ -364,14 +374,10 @@ public class ContentDirectoryService
         var resolutionAttr = !string.IsNullOrEmpty(resolution) ? $" resolution=\"{resolution}\"" : "";
         var durationAttr = !string.IsNullOrEmpty(duration) && duration != "0:00:00.000" ? $" duration=\"{duration}\"" : "";
         
-        // Add bitrate info if available for VLC
         var bitrate = mediaSource?.Bitrate;
         var bitrateAttr = bitrate.HasValue ? $" bitrate=\"{bitrate.Value}\"" : "";
         
-        // Get subtitle streams and add caption info
         var captionInfo = GetCaptionInfoXml(item);
-        
-        // Get subtitle streams for resources
         var subtitleResources = GetSubtitleResources(item);
         
         _logger.LogInformation("Creating media item XML: {Title} (Duration: {Duration}, Size: {Size}, Bitrate: {Bitrate}, Subtitles: {SubtitleCount})", 
@@ -403,11 +409,11 @@ public class ContentDirectoryService
         {
             if (mediaSource.MediaStreams == null) continue;
 
-            var subtitleStreams = mediaSource.MediaStreams
-                .Where(s => s.Type == MediaStream_Type.Subtitle)
+            var supportedSubtitleStreams = mediaSource.MediaStreams
+                .Where(s => s.Type == MediaStream_Type.Subtitle && IsSubtitleSupported(s.Codec))
                 .ToList();
 
-            foreach (var subtitleStream in subtitleStreams)
+            foreach (var subtitleStream in supportedSubtitleStreams)
             {
                 if (subtitleStream.Index == null) continue;
 
@@ -416,7 +422,6 @@ public class ContentDirectoryService
                 var dlnaPort = _configuration["Dlna:Port"] ?? "8200";
                 var subtitleUrl = $"http://{localIp}:{dlnaPort}/subtitle/{item.Id.Value}/{subtitleStream.Index.Value}";
 
-                // Add DLNA CaptionInfo element
                 captionInfos.Add($"<sec:CaptionInfo sec:type=\"srt\">{subtitleUrl}</sec:CaptionInfo>");
                 captionInfos.Add($"<sec:CaptionInfoEx sec:type=\"srt\">{language}:{subtitleUrl}</sec:CaptionInfoEx>");
             }
@@ -450,7 +455,7 @@ public class ContentDirectoryService
 
             foreach (var subtitleStream in subtitleStreams)
             {
-                _logger.LogDebug("Subtitle stream: Index={Index}, Language={Language}, Codec={Codec}, IsExternal={IsExternal}, DisplayTitle={DisplayTitle}", 
+                _logger.LogDebug("Evaluating subtitle stream: Index={Index}, Language={Language}, Codec={Codec}, IsExternal={IsExternal}, DisplayTitle={DisplayTitle}", 
                     subtitleStream.Index, 
                     subtitleStream.Language, 
                     subtitleStream.Codec,
@@ -463,22 +468,21 @@ public class ContentDirectoryService
                     continue;
                 }
 
+                if (!IsSubtitleSupported(subtitleStream.Codec))
+                {
+                    _logger.LogInformation("Skipping unsupported subtitle codec: {Codec} for item {ItemId}", 
+                        subtitleStream.Codec, item.Id.Value);
+                    continue;
+                }
+
                 var language = subtitleStream.Language ?? subtitleStream.Language ?? subtitleStream.DisplayTitle ?? "unknown";
-                var codec = subtitleStream.Codec?.ToLowerInvariant() ?? "srt";
                 
-                // For embedded subtitles, always convert to SRT via Jellyfin
-                var format = "srt";
-                var mimeType = "text/srt";
-                
-                // Use local DLNA server URL
                 var localIp = GetLocalIPAddress();
                 var dlnaPort = _configuration["Dlna:Port"] ?? "8200";
                 var subtitleUrl = $"http://{localIp}:{dlnaPort}/subtitle/{item.Id.Value}/{subtitleStream.Index.Value}";
                 
-                // Create subtitle resource with proper DLNA attributes
-                var protocolInfo = $"http-get:*:{mimeType}:*";
+                var protocolInfo = "http-get:*:text/srt:*";
                 
-                // Add language info to the protocol if available
                 if (!string.IsNullOrEmpty(language) && language != "unknown")
                 {
                     var resourceXml = $"<res protocolInfo=\"{protocolInfo}\" dlna:subtitle=\"{language}\">{subtitleUrl}</res>";
@@ -490,12 +494,47 @@ public class ContentDirectoryService
                     subtitleResources.Add(resourceXml);
                 }
                 
-                _logger.LogInformation("Added embedded subtitle resource for item {ItemId}: {Language} ({Codec}) -> {Format} at {Url}, Stream Index: {StreamIndex}", 
-                    item.Id.Value, language, codec, format, subtitleUrl, subtitleStream.Index.Value);
+                _logger.LogInformation("Added supported subtitle resource for item {ItemId}: {Language} ({Codec}) at {Url}, Stream Index: {StreamIndex}", 
+                    item.Id.Value, language, subtitleStream.Codec, subtitleUrl, subtitleStream.Index.Value);
             }
         }
 
         return subtitleResources;
+    }
+
+    // MARK: IsSubtitleSupported
+    private bool IsSubtitleSupported(string? codec)
+    {
+        if (string.IsNullOrEmpty(codec))
+        {
+            _logger.LogDebug("Subtitle stream has no codec information, treating as unsupported");
+            return false;
+        }
+
+        var normalizedCodec = codec.ToLowerInvariant();
+
+        if (UnsupportedSubtitleCodecs.Contains(normalizedCodec))
+        {
+            _logger.LogDebug("Subtitle codec {Codec} is explicitly unsupported", codec);
+            return false;
+        }
+
+        if (SupportedSubtitleCodecs.Contains(normalizedCodec))
+        {
+            _logger.LogDebug("Subtitle codec {Codec} is explicitly supported", codec);
+            return true;
+        }
+
+        _logger.LogDebug("Unknown subtitle codec {Codec}, treating as supported for conversion attempt", codec);
+        return true;
+    }
+
+    // MARK: GetProxyStreamUrl
+    private string GetProxyStreamUrl(Guid itemId)
+    {
+        var localIp = GetLocalIPAddress();
+        var dlnaPort = _configuration["Dlna:Port"] ?? "8200";
+        return $"http://{localIp}:{dlnaPort}/stream/{itemId}";
     }
 
     // MARK: GetLocalIPAddress
@@ -514,26 +553,8 @@ public class ContentDirectoryService
         }
         catch
         {
-            // Fallback
         }
         return "127.0.0.1";
-    }
-
-    // MARK: GetSubtitleFormatAndMimeType
-    private (string format, string mimeType) GetSubtitleFormatAndMimeType(string codec)
-    {
-        return codec switch
-        {
-            "srt" or "subrip" => ("srt", "text/srt"),
-            "ass" or "ssa" => ("ass", "text/x-ass"),
-            "vtt" or "webvtt" => ("vtt", "text/vtt"),
-            "sub" => ("sub", "text/x-microdvd"),
-            "idx" => ("sub", "text/x-idx"),
-            "pgs" => ("srt", "text/srt"), // Convert PGS to SRT via Jellyfin
-            "dvdsub" => ("srt", "text/srt"), // Convert DVD subtitles to SRT
-            "dvbsub" => ("srt", "text/srt"), // Convert DVB subtitles to SRT
-            _ => ("srt", "text/srt") // Default to SRT for unknown formats
-        };
     }
 
     // MARK: CreateContainerXml
@@ -642,13 +663,11 @@ public class ContentDirectoryService
 
         var timeSpan = TimeSpan.FromTicks(runTimeTicks.Value);
 
-        // VLC DLNA expects specific format - try multiple approaches
         var hours = (int)timeSpan.TotalHours;
         var minutes = timeSpan.Minutes;
         var seconds = timeSpan.Seconds;
         var milliseconds = timeSpan.Milliseconds;
 
-        // Format as H:MM:SS.mmm - this is the DLNA standard
         var formattedDuration = $"{hours}:{minutes:00}:{seconds:00}.{milliseconds:000}";
 
         _logger.LogDebug("Formatted duration for DLNA: {RunTimeTicks} ticks ({TotalSeconds}s) -> {FormattedDuration}",

@@ -73,6 +73,7 @@ builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<JellyfinService>();
 builder.Services.AddSingleton<SsdpService>();
 builder.Services.AddScoped<ContentDirectoryService>();
+builder.Services.AddSingleton<PlaybackReportingService>();
 builder.Services.AddSingleton<StreamingService>();
 builder.Services.AddSingleton<DlnaService>();
 builder.Services.AddHostedService<DlnaBackgroundService>();
@@ -125,25 +126,28 @@ startupLogger.LogInformation("FinDLNA starting on http://localhost:5000");
 app.Run("http://localhost:5000");
 
 // MARK: DlnaBackgroundService
-// MARK: DlnaBackgroundService
 public class DlnaBackgroundService : BackgroundService
 {
     private readonly DlnaService _dlnaService;
     private readonly JellyfinService _jellyfinService;
+    private readonly PlaybackReportingService _playbackReportingService;
     private readonly ILogger<DlnaBackgroundService> _logger;
     private readonly IServiceProvider _serviceProvider;
     private readonly IConfiguration _configuration;
     private Timer? _healthCheckTimer;
+    private Timer? _cleanupTimer;
 
     public DlnaBackgroundService(
         DlnaService dlnaService, 
-        JellyfinService jellyfinService, 
+        JellyfinService jellyfinService,
+        PlaybackReportingService playbackReportingService,
         ILogger<DlnaBackgroundService> logger,
         IServiceProvider serviceProvider,
         IConfiguration configuration)
     {
         _dlnaService = dlnaService;
         _jellyfinService = jellyfinService;
+        _playbackReportingService = playbackReportingService;
         _logger = logger;
         _serviceProvider = serviceProvider;
         _configuration = configuration;
@@ -161,6 +165,7 @@ public class DlnaBackgroundService : BackgroundService
                     _logger.LogInformation("DLNA service started successfully");
                     
                     StartHealthMonitoring(stoppingToken);
+                    StartSessionCleanup(stoppingToken);
                     
                     while (!stoppingToken.IsCancellationRequested && _jellyfinService.IsConfigured)
                     {
@@ -204,6 +209,7 @@ public class DlnaBackgroundService : BackgroundService
                 finally
                 {
                     _healthCheckTimer?.Dispose();
+                    _cleanupTimer?.Dispose();
                 }
             }
             else
@@ -237,6 +243,31 @@ public class DlnaBackgroundService : BackgroundService
         }, null, TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(2));
     }
 
+    // MARK: StartSessionCleanup
+    private void StartSessionCleanup(CancellationToken stoppingToken)
+    {
+        _cleanupTimer = new Timer(async _ =>
+        {
+            if (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await _playbackReportingService.CleanupStaleSessionsAsync();
+                    
+                    var activeSessions = await _playbackReportingService.GetActiveSessionsAsync();
+                    if (activeSessions.Count > 0)
+                    {
+                        _logger.LogDebug("Active playback sessions: {Count}", activeSessions.Count);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Session cleanup error");
+                }
+            }
+        }, null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
+    }
+
     // MARK: IsServiceHealthy
     private async Task<bool> IsServiceHealthy()
     {
@@ -268,6 +299,7 @@ public class DlnaBackgroundService : BackgroundService
         _logger.LogInformation("Stopping DLNA background service");
         
         _healthCheckTimer?.Dispose();
+        _cleanupTimer?.Dispose();
         
         try
         {

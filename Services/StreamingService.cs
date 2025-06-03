@@ -14,22 +14,31 @@ public class StreamingService
     private readonly IConfiguration _configuration;
     private readonly JellyfinService _jellyfinService;
     private readonly DeviceProfileService _deviceProfileService;
+    private readonly PlaybackReportingService _playbackReportingService;
 
     public StreamingService(
         ILogger<StreamingService> logger,
         IConfiguration configuration,
         JellyfinService jellyfinService,
-        DeviceProfileService deviceProfileService)
+        DeviceProfileService deviceProfileService,
+        PlaybackReportingService playbackReportingService)
     {
         _logger = logger;
         _configuration = configuration;
         _jellyfinService = jellyfinService;
         _deviceProfileService = deviceProfileService;
+        _playbackReportingService = playbackReportingService;
     }
 
     // MARK: HandleStreamRequest
     public async Task HandleStreamRequest(HttpListenerContext context, string itemId)
     {
+        string? sessionId = null;
+        Guid? itemGuid = null;
+
+        _logger.LogInformation("STREAM REQUEST: Handling stream request for item {ItemId} from {UserAgent} at {RemoteEndPoint}", 
+            itemId, context.Request.UserAgent, context.Request.RemoteEndPoint);
+
         try
         {
             if (!Guid.TryParse(itemId, out var guid))
@@ -39,10 +48,12 @@ public class StreamingService
                 return;
             }
 
+            itemGuid = guid;
             var userAgent = context.Request.UserAgent ?? "";
+            var clientEndpoint = context.Request.RemoteEndPoint?.ToString() ?? "";
             var deviceProfile = await _deviceProfileService.GetProfileAsync(userAgent);
             
-            _logger.LogInformation("Streaming request for item {ItemId} from {UserAgent}", itemId, userAgent);
+            _logger.LogInformation("Streaming request for item {ItemId} from {UserAgent} at {ClientEndpoint}", itemId, userAgent, clientEndpoint);
 
             var item = await _jellyfinService.GetItemAsync(guid);
             if (item == null)
@@ -50,6 +61,19 @@ public class StreamingService
                 _logger.LogWarning("Item not found: {ItemId}", itemId);
                 await SendErrorResponse(context, HttpStatusCode.NotFound, "Item not found");
                 return;
+            }
+
+            _logger.LogInformation("PLAYBACK START: Starting playback session for item {ItemId} - {ItemName}", 
+                guid, item.Name ?? "Unknown");
+
+            sessionId = await _playbackReportingService.StartPlaybackAsync(guid, userAgent, clientEndpoint);
+            if (sessionId != null)
+            {
+                _logger.LogInformation("Started playback session {SessionId} for item {ItemId}", sessionId, itemId);
+            }
+            else
+            {
+                _logger.LogWarning("Failed to start playback session for item {ItemId}", itemId);
             }
 
             var streamRequest = ParseStreamRequest(context, deviceProfile);
@@ -62,11 +86,21 @@ public class StreamingService
                 return;
             }
 
-            await StreamMediaAsync(context, streamInfo, streamRequest);
+            _logger.LogInformation("STREAMING: Starting media stream for item {ItemId}, session {SessionId}, direct play: {DirectPlay}", 
+                itemId, sessionId, streamInfo.IsDirectPlay);
+
+            await StreamMediaAsync(context, streamInfo, streamRequest, sessionId);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error handling stream request for item {ItemId}", itemId);
+
+            if (sessionId != null)
+            {
+                _logger.LogInformation("PLAYBACK ERROR: Stopping session {SessionId} due to error", sessionId);
+                await _playbackReportingService.StopPlaybackAsync(sessionId, markAsWatched: false);
+            }
+
             await SendErrorResponse(context, HttpStatusCode.InternalServerError, "Stream error");
         }
     }
@@ -129,13 +163,14 @@ public class StreamingService
                     IsDirectPlay = true,
                     Container = mediaSource.Container,
                     VideoCodec = videoStream?.Codec,
-                    AudioCodec = audioStream?.Codec
+                    AudioCodec = audioStream?.Codec,
+                    DurationTicks = item.RunTimeTicks ?? mediaSource.RunTimeTicks ?? 0
                 };
             }
             else
             {
                 _logger.LogInformation("Using transcoding for item {ItemId}", item.Id);
-                return await GetTranscodingStreamAsync(item.Id.Value, streamRequest, deviceProfile, mediaType);
+                return await GetTranscodingStreamAsync(item.Id.Value, streamRequest, deviceProfile, mediaType, item.RunTimeTicks ?? 0);
             }
         }
         catch (Exception ex)
@@ -156,6 +191,30 @@ public class StreamingService
         var videoStream = mediaSource.MediaStreams?.FirstOrDefault(s => s.Type == Jellyfin.Sdk.Generated.Models.MediaStream_Type.Video);
         var audioStream = mediaSource.MediaStreams?.FirstOrDefault(s => s.Type == Jellyfin.Sdk.Generated.Models.MediaStream_Type.Audio);
 
+        // Check if VLC can handle this format directly
+        var container = mediaSource.Container?.ToLowerInvariant();
+        var videoCodec = videoStream?.Codec?.ToLowerInvariant();
+        var audioCodec = audioStream?.Codec?.ToLowerInvariant();
+
+        // VLC handles these formats well without transcoding
+        var vlcCompatibleContainers = new[] { "mp4", "mkv", "avi", "mov" };
+        var vlcCompatibleVideoCodecs = new[] { "h264", "h.264", "avc", "hevc", "h265", "h.265" };
+        var vlcCompatibleAudioCodecs = new[] { "aac", "mp3", "ac3", "eac3", "dts" };
+
+        if (streamRequest.UserAgent.Contains("VLC", StringComparison.OrdinalIgnoreCase))
+        {
+            var containerOk = string.IsNullOrEmpty(container) || vlcCompatibleContainers.Contains(container);
+            var videoOk = string.IsNullOrEmpty(videoCodec) || vlcCompatibleVideoCodecs.Contains(videoCodec);
+            var audioOk = string.IsNullOrEmpty(audioCodec) || vlcCompatibleAudioCodecs.Contains(audioCodec);
+
+            if (containerOk && videoOk && audioOk)
+            {
+                _logger.LogInformation("VLC direct play: Container={Container}, Video={VideoCodec}, Audio={AudioCodec}", 
+                    container, videoCodec, audioCodec);
+                return Task.FromResult(true);
+            }
+        }
+
         return _deviceProfileService.ShouldDirectPlayAsync(
             deviceProfile, 
             mediaSource.Container, 
@@ -165,7 +224,7 @@ public class StreamingService
     }
 
     // MARK: GetTranscodingStreamAsync
-    private Task<StreamInfo?> GetTranscodingStreamAsync(Guid itemId, StreamRequest streamRequest, DeviceProfile? deviceProfile, string mediaType)
+    private Task<StreamInfo?> GetTranscodingStreamAsync(Guid itemId, StreamRequest streamRequest, DeviceProfile? deviceProfile, string mediaType, long durationTicks)
     {
         var transcodingProfile = deviceProfile?.TranscodingProfiles?.FirstOrDefault(p => 
             p.Type.Equals(mediaType, StringComparison.OrdinalIgnoreCase));
@@ -193,13 +252,21 @@ public class StreamingService
 
         var transcodingParams = new List<string>
         {
-            $"DeviceId={_configuration["JellyfinClient:DeviceId"]}",
             $"UserId={userId}",
-            $"Container={transcodingProfile.Container}",
-            $"VideoCodec={transcodingProfile.VideoCodec}",
-            $"AudioCodec={transcodingProfile.AudioCodec}",
+            $"DeviceId={_configuration["JellyfinClient:DeviceId"]}",
+            $"Container=mp4",
+            $"VideoCodec=h264",
+            $"AudioCodec=aac",
             "TranscodingMaxAudioChannels=2",
-            "BreakOnNonKeyFrames=true"
+            "BreakOnNonKeyFrames=true",
+            "EnableRedirection=false",
+            "EnableRemoteMedia=false",
+            "SegmentContainer=mp4",
+            "MinSegments=1",
+            "TranscodeSeekInfo=Auto",
+            "CopyTimestamps=false",
+            "EnableMpegtsM2TsMode=false",
+            "EnableSubtitlesInManifest=false"
         };
 
         if (streamRequest.MaxBitrate.HasValue)
@@ -212,30 +279,40 @@ public class StreamingService
             transcodingParams.Add($"VideoBitRate={deviceProfile.MaxStreamingBitrate}");
             transcodingParams.Add($"AudioBitRate=128000");
         }
+        else
+        {
+            transcodingParams.Add("VideoBitRate=8000000");
+            transcodingParams.Add("AudioBitRate=128000");
+        }
 
-        var transcodingUrl = $"{serverUrl}/Videos/{itemId}/stream.{transcodingProfile.Container}?" +
+        var transcodingUrl = $"{serverUrl}/Videos/{itemId}/stream.mp4?" +
                            string.Join("&", transcodingParams) +
                            $"&X-Emby-Token={accessToken}";
+
+        _logger.LogInformation("Generated fMP4 transcoding URL: {TranscodingUrl}", transcodingUrl);
 
         var streamInfo = new StreamInfo
         {
             Url = transcodingUrl,
-            MimeType = GetMimeTypeFromContainer(transcodingProfile.Container),
-            Size = 0,
+            MimeType = "video/mp4",
+            Size = 0, // Unknown for transcoded content
             IsDirectPlay = false,
-            Container = transcodingProfile.Container,
-            VideoCodec = transcodingProfile.VideoCodec,
-            AudioCodec = transcodingProfile.AudioCodec
+            Container = "mp4",
+            VideoCodec = "h264",
+            AudioCodec = "aac",
+            DurationTicks = durationTicks
         };
 
         return Task.FromResult<StreamInfo?>(streamInfo);
     }
 
     // MARK: StreamMediaAsync
-    private async Task StreamMediaAsync(HttpListenerContext context, StreamInfo streamInfo, StreamRequest streamRequest)
+    private async Task StreamMediaAsync(HttpListenerContext context, StreamInfo streamInfo, StreamRequest streamRequest, string? sessionId)
     {
         HttpClient? httpClient = null;
         Stream? sourceStream = null;
+        long totalBytesStreamed = 0;
+        var startTime = DateTime.UtcNow;
         
         try
         {
@@ -259,17 +336,14 @@ public class StreamingService
                 return;
             }
 
-            // Set basic content type
             context.Response.ContentType = streamInfo.MimeType;
             
-            // Forward Content-Length if available
             if (response.Content.Headers.ContentLength.HasValue)
             {
                 context.Response.ContentLength64 = response.Content.Headers.ContentLength.Value;
                 _logger.LogDebug("Forwarding Content-Length: {Length}", response.Content.Headers.ContentLength.Value);
             }
 
-            // Forward all relevant headers from Jellyfin response
             foreach (var header in response.Headers)
             {
                 switch (header.Key.ToLowerInvariant())
@@ -289,7 +363,6 @@ public class StreamingService
                 }
             }
 
-            // Forward Content headers
             foreach (var header in response.Content.Headers)
             {
                 switch (header.Key.ToLowerInvariant())
@@ -306,7 +379,6 @@ public class StreamingService
                 }
             }
 
-            // Set status code
             if (response.StatusCode == HttpStatusCode.PartialContent)
             {
                 context.Response.StatusCode = 206;
@@ -317,14 +389,10 @@ public class StreamingService
                 context.Response.StatusCode = 200;
             }
 
-            // Set DLNA-specific headers
             context.Response.AddHeader("Accept-Ranges", "bytes");
             context.Response.AddHeader("Connection", "keep-alive");
-            
-            // Add transferMode.dlna.org header for better DLNA compatibility
             context.Response.AddHeader("transferMode.dlna.org", "Streaming");
             
-            // Add DLNA content features if it's a direct play
             if (streamInfo.IsDirectPlay)
             {
                 var dlnaFeatures = "DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000";
@@ -337,22 +405,75 @@ public class StreamingService
 
             sourceStream = await response.Content.ReadAsStreamAsync();
             
-            await CopyStreamWithLoggingAsync(sourceStream, context.Response.OutputStream, streamInfo, context.Request.RemoteEndPoint);
+            totalBytesStreamed = await CopyStreamWithReportingAsync(
+                sourceStream, 
+                context.Response.OutputStream, 
+                streamInfo, 
+                context.Request.RemoteEndPoint,
+                sessionId);
+            
+            var playedDuration = DateTime.UtcNow - startTime;
+            var estimatedPositionTicks = CalculateEndPosition(totalBytesStreamed, streamInfo, playedDuration);
+
+            if (sessionId != null)
+            {
+                var watchThreshold = streamInfo.DurationTicks * 0.8;
+                var shouldMarkWatched = estimatedPositionTicks >= watchThreshold && watchThreshold > 0;
+                
+                await _playbackReportingService.StopPlaybackAsync(sessionId, estimatedPositionTicks, shouldMarkWatched);
+                
+                _logger.LogInformation("Stream session {SessionId} completed - Streamed: {StreamedMB}MB, Duration: {Duration}, Position: {Position}ms, Marked watched: {Watched}", 
+                    sessionId, totalBytesStreamed / 1024.0 / 1024.0, playedDuration, estimatedPositionTicks / 10000, shouldMarkWatched);
+            }
             
             _logger.LogInformation("Stream completed successfully for {Endpoint}", context.Request.RemoteEndPoint);
         }
         catch (HttpRequestException httpEx)
         {
             _logger.LogError(httpEx, "HTTP error during streaming");
+            
+            if (sessionId != null)
+            {
+                var playedDuration = DateTime.UtcNow - startTime;
+                var estimatedPositionTicks = CalculateEndPosition(totalBytesStreamed, streamInfo, playedDuration);
+                await _playbackReportingService.StopPlaybackAsync(sessionId, estimatedPositionTicks, markAsWatched: false);
+            }
+            
             await SendErrorResponse(context, HttpStatusCode.BadGateway, "Upstream error");
         }
         catch (OperationCanceledException)
         {
             _logger.LogInformation("Stream cancelled by client {Endpoint}", context.Request.RemoteEndPoint);
+            
+            if (sessionId != null)
+            {
+                var playedDuration = DateTime.UtcNow - startTime;
+                var estimatedPositionTicks = CalculateEndPosition(totalBytesStreamed, streamInfo, playedDuration);
+                await _playbackReportingService.StopPlaybackAsync(sessionId, estimatedPositionTicks, markAsWatched: false);
+            }
+        }
+        catch (Exception ex) when (ex is IOException || ex is System.Net.HttpListenerException)
+        {
+            _logger.LogInformation("Stream interrupted after {TotalMB:F1} MB - Client disconnected: {Error}", 
+                totalBytesStreamed / 1024.0 / 1024.0, ex.Message);
+            
+            if (sessionId != null)
+            {
+                var playedDuration = DateTime.UtcNow - startTime;
+                var estimatedPositionTicks = CalculateEndPosition(totalBytesStreamed, streamInfo, playedDuration);
+                var shouldMarkWatched = totalBytesStreamed > 0 && playedDuration.TotalMinutes > 1;
+                await _playbackReportingService.StopPlaybackAsync(sessionId, estimatedPositionTicks, markAsWatched: shouldMarkWatched);
+            }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error during streaming");
+            
+            if (sessionId != null)
+            {
+                await _playbackReportingService.StopPlaybackAsync(sessionId, markAsWatched: false);
+            }
+            
             await SendErrorResponse(context, HttpStatusCode.InternalServerError, "Stream error");
         }
         finally
@@ -370,14 +491,15 @@ public class StreamingService
         }
     }
 
-    // MARK: CopyStreamWithLoggingAsync
-    private async Task CopyStreamWithLoggingAsync(Stream source, Stream destination, StreamInfo streamInfo, System.Net.IPEndPoint? clientEndpoint)
+    // MARK: CopyStreamWithReportingAsync
+    private async Task<long> CopyStreamWithReportingAsync(Stream source, Stream destination, StreamInfo streamInfo, System.Net.IPEndPoint? clientEndpoint, string? sessionId)
     {
         const int bufferSize = 81920;
         var buffer = new byte[bufferSize];
         long totalBytes = 0;
         var startTime = DateTime.UtcNow;
         var lastLogTime = startTime;
+        var lastProgressReport = startTime;
 
         try
         {
@@ -392,6 +514,7 @@ public class StreamingService
                 totalBytes += bytesRead;
 
                 var now = DateTime.UtcNow;
+                
                 if ((now - lastLogTime).TotalSeconds >= 10)
                 {
                     var elapsed = now - startTime;
@@ -402,6 +525,15 @@ public class StreamingService
                     
                     lastLogTime = now;
                 }
+
+                if (sessionId != null && (now - lastProgressReport).TotalSeconds >= 30)
+                {
+                    var playedDuration = now - startTime;
+                    var estimatedPositionTicks = CalculateCurrentPosition(totalBytes, streamInfo, playedDuration);
+                    
+                    await _playbackReportingService.UpdatePlaybackProgressAsync(sessionId, estimatedPositionTicks, isPaused: false);
+                    lastProgressReport = now;
+                }
             }
 
             var finalElapsed = DateTime.UtcNow - startTime;
@@ -409,12 +541,63 @@ public class StreamingService
             
             _logger.LogInformation("Stream completed: {TotalMB:F1} MB in {Elapsed:mm\\:ss}, avg speed: {Speed:F1} MB/s, transcoded: {Transcoded}",
                 totalBytes / 1024.0 / 1024.0, finalElapsed, finalAvgSpeed, !streamInfo.IsDirectPlay);
+
+            return totalBytes;
         }
         catch (Exception ex) when (ex is IOException || ex is ObjectDisposedException)
         {
             _logger.LogInformation("Stream interrupted after {TotalMB:F1} MB (client disconnected)", totalBytes / 1024.0 / 1024.0);
             throw;
         }
+    }
+
+    // MARK: CalculateCurrentPosition
+    private long CalculateCurrentPosition(long bytesStreamed, StreamInfo streamInfo, TimeSpan playedDuration)
+    {
+        // For transcoded content, use time-based estimation since size is unknown
+        if (!streamInfo.IsDirectPlay || streamInfo.Size <= 0)
+        {
+            return playedDuration.Ticks;
+        }
+
+        // For direct play with known size, use byte-based calculation
+        if (streamInfo.Size > 0 && streamInfo.DurationTicks > 0)
+        {
+            var progressRatio = (double)bytesStreamed / streamInfo.Size;
+            var estimatedPositionTicks = (long)(streamInfo.DurationTicks * progressRatio);
+            return Math.Min(estimatedPositionTicks, streamInfo.DurationTicks);
+        }
+
+        return playedDuration.Ticks;
+    }
+
+    // MARK: CalculateEndPosition
+    private long CalculateEndPosition(long totalBytesStreamed, StreamInfo streamInfo, TimeSpan totalPlayedDuration)
+    {
+        // For transcoded content, use time-based estimation
+        if (!streamInfo.IsDirectPlay || streamInfo.Size <= 0)
+        {
+            // If we streamed for a reasonable amount of time, assume it's the played duration
+            if (totalPlayedDuration.TotalSeconds > 10)
+            {
+                return Math.Min(totalPlayedDuration.Ticks, streamInfo.DurationTicks);
+            }
+            else
+            {
+                // Very short duration suggests immediate disconnect, return 0
+                return 0;
+            }
+        }
+
+        // For direct play with known size
+        if (streamInfo.Size > 0 && streamInfo.DurationTicks > 0 && totalBytesStreamed > 0)
+        {
+            var progressRatio = (double)totalBytesStreamed / streamInfo.Size;
+            var estimatedPositionTicks = (long)(streamInfo.DurationTicks * progressRatio);
+            return Math.Min(estimatedPositionTicks, streamInfo.DurationTicks);
+        }
+
+        return Math.Min(totalPlayedDuration.Ticks, streamInfo.DurationTicks);
     }
 
     // MARK: SendErrorResponse
@@ -499,4 +682,5 @@ public class StreamInfo
     public string? Container { get; set; }
     public string? VideoCodec { get; set; }
     public string? AudioCodec { get; set; }
+    public long DurationTicks { get; set; }
 }
