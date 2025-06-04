@@ -47,4 +47,27 @@ public class StreamProgress
     public long CurrentTicks { get; set; }
     public DateTime StartTime { get; set; }
     public DateTime LastUpdateTime { get; set; }
+
+    // Enhanced tracking for better position management
+    public long InitialPosition { get; set; }
+    public bool HasBeenSeeked { get; set; }
+    public DateTime? LastSeekTime { get; set; }
+
+    // Rate limiting for position updates
+    public DateTime LastReportedTime { get; set; }
+    public long LastReportedPosition { get; set; }
+
+    // Statistics
+    public long TotalBytesStreamed { get; set; }
+    public int ReportCount { get; set; }
+}
+
+// MARK: Supporting Classes
+public class ActiveSession
+{
+    public string SessionId { get; set; } = string.Empty;
+    public Guid ItemId { get; set; }
+    public string UserAgent { get; set; } = string.Empty;
+    public string ClientEndpoint { get; set; } = string.Empty;
+    public DateTime StartTime { get; set; }
 }

@@ -1,4 +1,3 @@
-<?xml version="1.0"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
     <specVersion>
         <major>1</major>
@@ -7,15 +6,15 @@
     <device>
         <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
         <friendlyName>{0}</friendlyName>
-        <manufacturer>{1}</manufacturer>
-        <manufacturerURL>http://www.findlna.com</manufacturerURL>
-        <modelDescription>Jellyfin</modelDescription>
-        <modelName>{2}</modelName>
-        <modelNumber>{3}</modelNumber>
-        <modelURL>http://www.findlna.com</modelURL>
-        <serialNumber>findlna-001</serialNumber>
-        <UDN>uuid:{4}</UDN>
-        <presentationURL>{5}</presentationURL>
+        <manufacturer>DLNA Proxy</manufacturer>
+        <manufacturerURL>https://github.com/JPKribs/jellyfin-dlna-proxy</manufacturerURL>
+        <modelDescription>DLNA Proxy</modelDescription>
+        <modelName>DLNA Proxy</modelName>
+        <modelNumber>1.0</modelNumber>
+        <modelURL>https://github.com/JPKribs/jellyfin-dlna-proxy</modelURL>
+        <serialNumber>findlna-{1}</serialNumber>
+        <UDN>uuid:{2}</UDN>
+        <presentationURL>{3}</presentationURL>
         <serviceList>
             <service>
                 <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>

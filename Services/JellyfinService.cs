@@ -59,9 +59,26 @@ public class JellyfinService
                 requestConfiguration.QueryParameters.IncludeItemTypes = [BaseItemKind.CollectionFolder];
                 requestConfiguration.QueryParameters.SortBy = [ItemSortBy.SortName];
                 requestConfiguration.QueryParameters.SortOrder = [SortOrder.Ascending];
+                
+                requestConfiguration.QueryParameters.Fields = [
+                    ItemFields.MediaSources,
+                    ItemFields.Path,
+                    ItemFields.SortName,
+                    ItemFields.DateCreated,
+                    ItemFields.ChildCount
+                ];
             });
 
-            _logger.LogDebug("Retrieved {Count} library folders", response?.Items?.Count ?? 0);
+            _logger.LogInformation("Retrieved {Count} library folders", response?.Items?.Count ?? 0);
+            
+            if (response?.Items?.Any() == true)
+            {
+                foreach (var lib in response.Items)
+                {
+                    _logger.LogInformation("Library: {Name} (ID: {Id}, Type: {CollectionType}, ChildCount: {ChildCount})", 
+                        lib.Name, lib.Id, lib.CollectionType, lib.ChildCount);
+                }
+            }
 
             return response?.Items;
         }
@@ -81,6 +98,8 @@ public class JellyfinService
         {
             var userId = Guid.Parse(_configuration["Jellyfin:UserId"] ?? "");
 
+            _logger.LogInformation("Fetching content for library {LibraryId}", libraryId);
+
             var response = await _apiClient.Items.GetAsync(requestConfiguration =>
             {
                 var accessToken = _configuration["Jellyfin:AccessToken"];
@@ -91,19 +110,69 @@ public class JellyfinService
 
                 requestConfiguration.QueryParameters.UserId = userId;
                 requestConfiguration.QueryParameters.ParentId = libraryId;
-                requestConfiguration.QueryParameters.Recursive = true;
+                requestConfiguration.QueryParameters.Recursive = false; // Only direct children
                 requestConfiguration.QueryParameters.EnableTotalRecordCount = true;
-                requestConfiguration.QueryParameters.SortBy = [ItemSortBy.SortName];
+                requestConfiguration.QueryParameters.SortBy = [ItemSortBy.SortName, ItemSortBy.IndexNumber];
                 requestConfiguration.QueryParameters.SortOrder = [SortOrder.Ascending];
 
+                // Include all relevant content types
+                requestConfiguration.QueryParameters.IncludeItemTypes = [
+                    BaseItemKind.Movie,
+                    BaseItemKind.Series,
+                    BaseItemKind.Season,
+                    BaseItemKind.Episode,
+                    BaseItemKind.Audio,
+                    BaseItemKind.MusicAlbum,
+                    BaseItemKind.MusicArtist,
+                    BaseItemKind.Photo,
+                    BaseItemKind.Video,
+                    BaseItemKind.Folder,
+                    BaseItemKind.BoxSet,
+                    BaseItemKind.CollectionFolder
+                ];
+
+                // Exclude problematic types
                 requestConfiguration.QueryParameters.ExcludeItemTypes = [
                     BaseItemKind.Person,
                     BaseItemKind.Genre,
                     BaseItemKind.Studio
                 ];
+
+                requestConfiguration.QueryParameters.Fields = [
+                    ItemFields.MediaSources,
+                    ItemFields.MediaStreams,
+                    ItemFields.Path,
+                    ItemFields.Overview,
+                    ItemFields.ProviderIds,
+                    ItemFields.SortName,
+                    ItemFields.DateCreated,
+                    ItemFields.ChildCount,
+                    ItemFields.ParentId,
+                    ItemFields.Genres,
+                    ItemFields.Studios
+                ];
+
+                // Get all items - no limit
+                requestConfiguration.QueryParameters.Limit = null;
+                requestConfiguration.QueryParameters.StartIndex = null;
             });
 
-            _logger.LogDebug("Retrieved {Count} items from library {LibraryId}", response?.Items?.Count ?? 0, libraryId);
+            var itemCount = response?.Items?.Count ?? 0;
+            _logger.LogInformation("Retrieved {Count} items from library {LibraryId}", itemCount, libraryId);
+
+            if (response?.Items?.Any() == true)
+            {
+                var grouped = response.Items.GroupBy(i => i.Type).ToDictionary(g => g.Key, g => g.Count());
+                foreach (var group in grouped)
+                {
+                    _logger.LogInformation("Library {LibraryId} has {Count} items of type {Type}", 
+                        libraryId, group.Value, group.Key);
+                }
+            }
+            else
+            {
+                _logger.LogWarning("No items found in library {LibraryId}", libraryId);
+            }
 
             return response?.Items;
         }
@@ -123,6 +192,8 @@ public class JellyfinService
         {
             var userId = Guid.Parse(_configuration["Jellyfin:UserId"] ?? "");
 
+            _logger.LogDebug("Fetching items for parent {ParentId}", parentId);
+
             var response = await _apiClient.Items.GetAsync(requestConfiguration =>
             {
                 var accessToken = _configuration["Jellyfin:AccessToken"];
@@ -133,11 +204,11 @@ public class JellyfinService
 
                 requestConfiguration.QueryParameters.UserId = userId;
                 requestConfiguration.QueryParameters.EnableTotalRecordCount = true;
+                requestConfiguration.QueryParameters.Recursive = false; // Direct children only
 
                 if (parentId.HasValue)
                 {
                     requestConfiguration.QueryParameters.ParentId = parentId.Value;
-                    requestConfiguration.QueryParameters.Recursive = false;
                 }
 
                 if (!string.IsNullOrEmpty(mediaTypes))
@@ -148,7 +219,7 @@ public class JellyfinService
                     requestConfiguration.QueryParameters.MediaTypes = mediaTypeEnums;
                 }
 
-                requestConfiguration.QueryParameters.SortBy = [ItemSortBy.SortName];
+                requestConfiguration.QueryParameters.SortBy = [ItemSortBy.SortName, ItemSortBy.IndexNumber];
                 requestConfiguration.QueryParameters.SortOrder = [SortOrder.Ascending];
 
                 requestConfiguration.QueryParameters.Fields = [
@@ -157,11 +228,20 @@ public class JellyfinService
                     ItemFields.Path,
                     ItemFields.Overview,
                     ItemFields.ProviderIds,
-                    ItemFields.SortName
+                    ItemFields.SortName,
+                    ItemFields.DateCreated,
+                    ItemFields.ChildCount,
+                    ItemFields.ParentId,
+                    ItemFields.Genres
                 ];
+
+                // Get all items - no limit
+                requestConfiguration.QueryParameters.Limit = null;
+                requestConfiguration.QueryParameters.StartIndex = null;
             });
 
-            _logger.LogDebug("Retrieved {Count} items for parent {ParentId}", response?.Items?.Count ?? 0, parentId);
+            var itemCount = response?.Items?.Count ?? 0;
+            _logger.LogDebug("Retrieved {Count} items for parent {ParentId}", itemCount, parentId);
 
             return response?.Items;
         }
@@ -187,6 +267,13 @@ public class JellyfinService
                     config.Headers.Add("X-Emby-Token", accessToken);
                 }
             });
+            
+            if (response != null)
+            {
+                _logger.LogTrace("Retrieved item {ItemId} ({Name}, Type: {Type})", 
+                    itemId, response.Name, response.Type);
+            }
+            
             return response;
         }
         catch (Exception ex)
@@ -223,7 +310,11 @@ public class JellyfinService
             }
 
             var queryString = string.Join("&", queryParams);
-            return $"{serverUrl}/Videos/{itemId}/stream?{queryString}";
+            var streamUrl = $"{serverUrl}/Videos/{itemId}/stream?{queryString}";
+            
+            _logger.LogTrace("Generated stream URL for {ItemId}", itemId);
+            
+            return streamUrl;
         }
         catch (Exception ex)
         {
@@ -246,7 +337,7 @@ public class JellyfinService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to get image URL for item {ItemId}", itemId);
+            _logger.LogTrace(ex, "Failed to get image URL for item {ItemId}", itemId);
             return null;
         }
     }
@@ -275,13 +366,39 @@ public class JellyfinService
             var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
             var accessToken = _configuration["Jellyfin:AccessToken"];
             
-            // For embedded subtitles, use the media info endpoint with stream index
             return $"{serverUrl}/Videos/{itemId}/{subtitleStreamIndex}/Subtitles.{format}?X-Emby-Token={accessToken}";
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to get subtitle URL for item {ItemId}, stream {StreamIndex}", itemId, subtitleStreamIndex);
             return null;
+        }
+    }
+
+    // MARK: TestConnectionAsync
+    public async Task<bool> TestConnectionAsync()
+    {
+        if (!IsConfigured) return false;
+
+        try
+        {
+            var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
+            var accessToken = _configuration["Jellyfin:AccessToken"];
+
+            using var httpClient = new HttpClient();
+            httpClient.DefaultRequestHeaders.Add("X-Emby-Token", accessToken);
+
+            var response = await httpClient.GetAsync($"{serverUrl}/System/Info");
+            var isSuccess = response.IsSuccessStatusCode;
+
+            _logger.LogInformation("Connection test {Result}", isSuccess ? "PASSED" : "FAILED");
+
+            return isSuccess;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Connection test failed");
+            return false;
         }
     }
 }

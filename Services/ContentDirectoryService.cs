@@ -90,12 +90,11 @@ public class ContentDirectoryService
             var startingIndex = int.Parse(browseElement.Element("StartingIndex")?.Value ?? "0");
             var requestedCount = int.Parse(browseElement.Element("RequestedCount")?.Value ?? "0");
 
-            _logger.LogDebug("Browse request: ObjectID={ObjectId}, Flag={Flag}, Start={Start}, Count={Count}",
-                objectId, browseFlag, startingIndex, requestedCount);
+            _logger.LogInformation("Browse request: ObjectID={ObjectId}, Flag={Flag}, Start={Start}, Count={Count}, UserAgent={UserAgent}",
+                objectId, browseFlag, startingIndex, requestedCount, userAgent);
 
             BrowseResult result;
             
-            // MARK: Handle BrowseMetadata differently for Samsung TVs
             if (browseFlag == "BrowseMetadata")
             {
                 result = await ProcessBrowseMetadataAsync(objectId, userAgent);
@@ -105,11 +104,14 @@ public class ContentDirectoryService
                 result = await ProcessBrowseAsync(objectId, browseFlag, startingIndex, requestedCount, userAgent);
             }
 
+            _logger.LogInformation("Browse result: {NumberReturned} items returned, {TotalMatches} total matches for ObjectID={ObjectId}",
+                result.NumberReturned, result.TotalMatches, objectId);
+
             return CreateBrowseResponse(result.DidlXml, result.NumberReturned, result.TotalMatches);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error processing browse request");
+            _logger.LogError(ex, "Error processing browse request.");
             return CreateSoapFault("Internal server error");
         }
     }
@@ -121,7 +123,6 @@ public class ContentDirectoryService
         
         if (objectId == "0")
         {
-            // MARK: For root metadata, return the MediaServer container itself
             var rootContainer = CreateContainerXml(
                 "0",
                 "-1",
@@ -135,7 +136,6 @@ public class ContentDirectoryService
             return new BrowseResult { DidlXml = didlXml, NumberReturned = 1, TotalMatches = 1 };
         }
 
-        // MARK: For other items, try to get their metadata
         if (objectId.StartsWith("library:"))
         {
             var libraryId = objectId.Substring(8);
@@ -150,8 +150,8 @@ public class ContentDirectoryService
                         objectId,
                         "0",
                         library.Name ?? "Unknown",
-                        "object.container.storageFolder",
-                        library.ChildCount ?? 0,
+                        GetLibraryUpnpClass(library),
+                        await GetLibraryChildCountAsync(libGuid),
                         library.Id
                     );
                     
@@ -174,7 +174,7 @@ public class ContentDirectoryService
                         GetParentId(item),
                         item.Name ?? "Unknown",
                         GetUpnpClass(item.Type ?? BaseItemDto_Type.Folder),
-                        item.ChildCount ?? 0,
+                        await GetItemChildCountAsync(itemGuid),
                         item.Id
                     );
                 }
@@ -188,17 +188,87 @@ public class ContentDirectoryService
             }
         }
 
-        // MARK: Fallback for unknown items
         var didlEmpty = CreateDidlXml("");
         return new BrowseResult { DidlXml = didlEmpty, NumberReturned = 0, TotalMatches = 0 };
+    }
+
+    // MARK: GetLibraryChildCountAsync
+    private async Task<int> GetLibraryChildCountAsync(Guid libraryId)
+    {
+        try
+        {
+            var items = await _jellyfinService.GetItemsAsync(libraryId);
+            if (items == null) return 0;
+
+            var count = items.Count(item => 
+                item.Id.HasValue && 
+                !ExcludedFolderNames.Contains(item.Name ?? "") &&
+                (ContainerTypes.Contains(item.Type ?? BaseItemDto_Type.Folder) || 
+                 MediaTypes.Contains(item.Type ?? BaseItemDto_Type.Folder)));
+
+            _logger.LogDebug("Library child count: Library {LibraryId} has {Count} items", libraryId, count);
+            return count;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting child count for library {LibraryId}", libraryId);
+            return 0;
+        }
+    }
+
+    // MARK: GetItemChildCountAsync
+    private async Task<int> GetItemChildCountAsync(Guid itemId)
+    {
+        try
+        {
+            var items = await _jellyfinService.GetItemsAsync(itemId);
+            if (items == null) return 0;
+
+            var count = items.Count(item => 
+                item.Id.HasValue && 
+                !ExcludedFolderNames.Contains(item.Name ?? "") &&
+                (ContainerTypes.Contains(item.Type ?? BaseItemDto_Type.Folder) || 
+                 MediaTypes.Contains(item.Type ?? BaseItemDto_Type.Folder)));
+
+            _logger.LogDebug("Item child count: Item {ItemId} has {Count} children", itemId, count);
+            return count;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting child count for item {ItemId}", itemId);
+            return 0;
+        }
+    }
+
+    // MARK: GetLibraryUpnpClass
+    private string GetLibraryUpnpClass(BaseItemDto library)
+    {
+        var collectionType = library.CollectionType;
+        
+        return collectionType switch
+        {
+            BaseItemDto_CollectionType.Movies => "object.container.genre.movieGenre",
+            BaseItemDto_CollectionType.Tvshows => "object.container.genre.movieGenre", 
+            BaseItemDto_CollectionType.Music => "object.container.storageFolder",
+            BaseItemDto_CollectionType.Photos => "object.container.album.photoAlbum",
+            BaseItemDto_CollectionType.Books => "object.container.storageFolder",
+            _ => "object.container.storageFolder"
+        };
     }
 
     // MARK: GetParentId
     private string GetParentId(BaseItemDto item)
     {
-        // MARK: Determine parent ID based on item structure
         if (item.ParentId.HasValue)
         {
+            var libraries = _jellyfinService.GetLibraryFoldersAsync().Result;
+            var isLibraryFolder = libraries?.Any(l => l.Id == item.ParentId.Value) == true;
+            
+            if (isLibraryFolder)
+            {
+                return $"library:{item.ParentId.Value}";
+            }
+            
             return item.ParentId.Value.ToString();
         }
         return "0";
@@ -241,9 +311,9 @@ public class ContentDirectoryService
     private async Task<BrowseResult> BrowseRootAsync()
     {
         var libraries = await _jellyfinService.GetLibraryFoldersAsync();
-        if (libraries == null)
+        if (libraries == null || !libraries.Any())
         {
-            _logger.LogWarning("Failed to get library folders");
+            _logger.LogWarning("No library folders found");
             return new BrowseResult { DidlXml = CreateDidlXml(""), NumberReturned = 0, TotalMatches = 0 };
         }
 
@@ -252,33 +322,40 @@ public class ContentDirectoryService
         {
             if (library.Id.HasValue)
             {
+                var childCount = await GetLibraryChildCountAsync(library.Id.Value);
                 var container = CreateContainerXml(
                     $"library:{library.Id.Value}",
                     "0",
                     library.Name ?? "Unknown",
-                    "object.container.storageFolder",
-                    library.ChildCount ?? 0,
+                    GetLibraryUpnpClass(library),
+                    childCount,
                     library.Id.Value
                 );
                 containers.Add(container);
+                
+                _logger.LogInformation("Added library {LibraryName} with {ChildCount} items", 
+                    library.Name, childCount);
             }
         }
 
         var didlXml = CreateDidlXml(string.Join("", containers));
+        _logger.LogInformation("Returning {Count} libraries", containers.Count);
         return new BrowseResult { DidlXml = didlXml, NumberReturned = containers.Count, TotalMatches = containers.Count };
     }
 
     // MARK: BrowseLibraryAsync
     private async Task<BrowseResult> BrowseLibraryAsync(Guid libraryId, int startingIndex, int requestedCount)
     {
-        var items = await _jellyfinService.GetItemsAsync(libraryId);
-        if (items == null)
+        _logger.LogInformation("Browsing library {LibraryId}", libraryId);
+        
+        var items = await _jellyfinService.GetLibraryContentAsync(libraryId);
+        if (items == null || !items.Any())
         {
-            _logger.LogWarning("Failed to get library content for {LibraryId}", libraryId);
+            _logger.LogWarning("No content found for library {LibraryId}", libraryId);
             return new BrowseResult { DidlXml = CreateDidlXml(""), NumberReturned = 0, TotalMatches = 0 };
         }
 
-        var allResults = new List<(bool isContainer, string xml, string title)>();
+        var allResults = new List<(bool isContainer, string xml, string title, int sortIndex)>();
 
         foreach (var item in items)
         {
@@ -288,47 +365,47 @@ public class ContentDirectoryService
             var itemType = item.Type ?? BaseItemDto_Type.Folder;
             var itemName = item.Name ?? "Unknown";
 
-            _logger.LogDebug("Processing library item: {Name} (Type: {Type})", itemName, itemType);
+            _logger.LogTrace("Processing item {Name} (Type: {Type})", itemName, itemType);
 
             if (ContainerTypes.Contains(itemType))
             {
+                var childCount = await GetItemChildCountAsync(item.Id.Value);
                 var containerXml = CreateContainerXml(
                     item.Id.Value.ToString(),
                     $"library:{libraryId}",
                     itemName,
                     GetUpnpClass(itemType),
-                    item.ChildCount ?? 0,
+                    childCount,
                     item.Id.Value
                 );
-                allResults.Add((true, containerXml, itemName));
-                _logger.LogDebug("Added library container: {Name}", itemName);
+                allResults.Add((true, containerXml, itemName, item.IndexNumber ?? int.MaxValue));
+                _logger.LogDebug("Added container {Name} with {ChildCount} children", itemName, childCount);
             }
             else if (MediaTypes.Contains(itemType))
             {
                 var itemXml = CreateItemXml(item, $"library:{libraryId}");
                 if (!string.IsNullOrEmpty(itemXml))
                 {
-                    allResults.Add((false, itemXml, itemName));
-                    _logger.LogDebug("Added library media item: {Name} (XML length: {Length})", itemName, itemXml.Length);
+                    allResults.Add((false, itemXml, itemName, item.IndexNumber ?? int.MaxValue));
+                    _logger.LogDebug("Added media item {Name}", itemName);
                 }
                 else
                 {
-                    _logger.LogWarning("Failed to create XML for library media item: {Name} (Type: {Type})", itemName, itemType);
+                    _logger.LogWarning("Failed to create XML for media item {Name} (Type: {Type})", itemName, itemType);
                 }
             }
             else
             {
-                _logger.LogDebug("Skipped library item: {Name} (Type: {Type}) - not container or media", itemName, itemType);
+                _logger.LogTrace("Skipped item {Name} (Type: {Type}) - not container or media", itemName, itemType);
             }
         }
 
-        _logger.LogInformation("BrowseLibraryAsync for {LibraryId}: Found {Total} items ({Containers} containers, {Media} media)",
-            libraryId, allResults.Count,
-            allResults.Count(x => x.isContainer),
-            allResults.Count(x => !x.isContainer));
+        _logger.LogInformation("Found {Total} valid items ({Containers} containers, {Media} media) in library {LibraryId}",
+            allResults.Count, allResults.Count(x => x.isContainer), allResults.Count(x => !x.isContainer), libraryId);
 
         var sortedResults = allResults
             .OrderBy(x => !x.isContainer)
+            .ThenBy(x => x.sortIndex)
             .ThenBy(x => x.title)
             .ToList();
 
@@ -346,14 +423,16 @@ public class ContentDirectoryService
     // MARK: BrowseItemAsync
     private async Task<BrowseResult> BrowseItemAsync(Guid itemId, int startingIndex, int requestedCount)
     {
+        _logger.LogInformation("Browsing item {ItemId}", itemId);
+        
         var items = await _jellyfinService.GetItemsAsync(itemId);
-        if (items == null)
+        if (items == null || !items.Any())
         {
-            _logger.LogWarning("Failed to get item content for {ItemId}", itemId);
+            _logger.LogWarning("No content found for item {ItemId}", itemId);
             return new BrowseResult { DidlXml = CreateDidlXml(""), NumberReturned = 0, TotalMatches = 0 };
         }
 
-        var allResults = new List<(BaseItemDto item, bool isContainer, string xml, string title)>();
+        var allResults = new List<(BaseItemDto item, bool isContainer, string xml, string title, int sortIndex)>();
 
         foreach (var item in items)
         {
@@ -363,49 +442,48 @@ public class ContentDirectoryService
             var itemType = item.Type ?? BaseItemDto_Type.Folder;
             var itemName = item.Name ?? "Unknown";
 
-            _logger.LogDebug("Processing item: {Name} (Type: {Type})", itemName, itemType);
+            _logger.LogTrace("Processing child {Name} (Type: {Type})", itemName, itemType);
 
             if (ContainerTypes.Contains(itemType))
             {
+                var childCount = await GetItemChildCountAsync(item.Id.Value);
                 var containerXml = CreateContainerXml(
                     item.Id.Value.ToString(),
                     itemId.ToString(),
                     itemName,
                     GetUpnpClass(itemType),
-                    item.ChildCount ?? 0,
+                    childCount,
                     item.Id.Value
                 );
-                allResults.Add((item, true, containerXml, itemName));
-                _logger.LogDebug("Added container: {Name}", itemName);
+                allResults.Add((item, true, containerXml, itemName, item.IndexNumber ?? int.MaxValue));
+                _logger.LogDebug("Added container {Name} with {ChildCount} children", itemName, childCount);
             }
             else if (MediaTypes.Contains(itemType))
             {
                 var itemXml = CreateItemXml(item, itemId.ToString());
                 if (!string.IsNullOrEmpty(itemXml))
                 {
-                    allResults.Add((item, false, itemXml, itemName));
-                    _logger.LogDebug("Added media item: {Name} (XML length: {Length})", itemName, itemXml.Length);
+                    allResults.Add((item, false, itemXml, itemName, item.IndexNumber ?? int.MaxValue));
+                    _logger.LogDebug("Added media item {Name}", itemName);
                 }
                 else
                 {
-                    _logger.LogWarning("Failed to create XML for media item: {Name} (Type: {Type})", itemName, itemType);
+                    _logger.LogWarning("Failed to create XML for media item {Name} (Type: {Type})", itemName, itemType);
                 }
             }
             else
             {
-                _logger.LogDebug("Skipped item: {Name} (Type: {Type}) - not container or media", itemName, itemType);
+                _logger.LogTrace("Skipped child {Name} (Type: {Type}) - not container or media", itemName, itemType);
             }
         }
 
-        _logger.LogInformation("BrowseItemAsync for {ItemId}: Found {Total} items ({Containers} containers, {Media} media)",
-            itemId, allResults.Count,
-            allResults.Count(x => x.isContainer),
-            allResults.Count(x => !x.isContainer));
+        _logger.LogInformation("Found {Total} valid items ({Containers} containers, {Media} media) in item {ItemId}",
+            allResults.Count, allResults.Count(x => x.isContainer), allResults.Count(x => !x.isContainer), itemId);
 
         var sortedResults = allResults
             .OrderBy(x => !x.isContainer)
             .ThenBy(x => (x.item.Type == BaseItemDto_Type.Episode || x.item.Type == BaseItemDto_Type.Season)
-                ? x.item.IndexNumber ?? int.MaxValue
+                ? x.sortIndex
                 : int.MaxValue)
             .ThenBy(x => x.title)
             .ToList();
@@ -464,8 +542,7 @@ public class ContentDirectoryService
         );
         
         var albumArtUrl = GetAlbumArtUrl(item.Id.Value);
-        var albumArtXml = !string.IsNullOrEmpty(albumArtUrl) ? 
-            $"<upnp:albumArtURI>{albumArtUrl}</upnp:albumArtURI>" : "";
+        var additionalMetadata = BuildEnhancedMetadata(item, albumArtUrl);
         
         var resolutionAttr = !string.IsNullOrEmpty(resolution) ? $" resolution=\"{resolution}\"" : "";
         var durationAttr = !string.IsNullOrEmpty(duration) ? $" duration=\"{duration}\"" : "";
@@ -476,8 +553,7 @@ public class ContentDirectoryService
         
         var attributes = $"{sizeAttr}{durationAttr}{resolutionAttr}{bitrateAttr}";
         
-        _logger.LogInformation("Creating DLNA item: {Title} (Duration: {Duration}, Size: {Size} bytes, Bitrate: {Bitrate})", 
-            title, duration, size, bitrate);
+        _logger.LogDebug("Creating DLNA item {Title} for {ItemId}", title, item.Id.Value);
         
         var dlnaFlags = "DLNA.ORG_PN=AVC_MP4_MP_HD_1080i_AAC;DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000";
         var protocolInfo = $"http-get:*:{mimeType}:{dlnaFlags}";
@@ -488,11 +564,53 @@ public class ContentDirectoryService
             title,                   // {2} - title
             DateTime.UtcNow.ToString("yyyy-MM-dd"), // {3} - date
             upnpClass,               // {4} - upnp:class
-            albumArtXml,             // {5} - album art
+            additionalMetadata,      // {5} - additional metadata
             protocolInfo,            // {6} - protocolInfo
             attributes,              // {7} - res attributes
             streamUrl                // {8} - stream URL
         );
+    }
+
+    // MARK: BuildEnhancedMetadata
+    private string BuildEnhancedMetadata(BaseItemDto item, string? albumArtUrl)
+    {
+        var metadata = new StringBuilder();
+        
+        if (!string.IsNullOrEmpty(albumArtUrl))
+        {
+            metadata.AppendLine($"<upnp:albumArtURI>{albumArtUrl}</upnp:albumArtURI>");
+        }
+        
+        if (!string.IsNullOrEmpty(item.Overview))
+        {
+            var description = item.Overview.Length > 200 ? item.Overview.Substring(0, 200) + "..." : item.Overview;
+            metadata.AppendLine($"<dc:description>{System.Security.SecurityElement.Escape(description)}</dc:description>");
+        }
+        
+        if (item.ProductionYear.HasValue)
+        {
+            metadata.AppendLine($"<dc:date>{item.ProductionYear}</dc:date>");
+        }
+        
+        if (item.Type == BaseItemDto_Type.Episode && item.IndexNumber.HasValue)
+        {
+            metadata.AppendLine($"<upnp:episodeNumber>{item.IndexNumber}</upnp:episodeNumber>");
+            if (item.ParentIndexNumber.HasValue)
+            {
+                metadata.AppendLine($"<upnp:episodeSeason>{item.ParentIndexNumber}</upnp:episodeSeason>");
+            }
+        }
+        
+        var genres = item.Genres?.Take(2);
+        if (genres?.Any() == true)
+        {
+            foreach (var genre in genres)
+            {
+                metadata.AppendLine($"<upnp:genre>{System.Security.SecurityElement.Escape(genre)}</upnp:genre>");
+            }
+        }
+        
+        return metadata.ToString().TrimEnd();
     }
 
     // MARK: FormatDurationForDlna
@@ -512,7 +630,7 @@ public class ContentDirectoryService
             return 0;
 
         var durationSeconds = TimeConversionUtil.TicksToSeconds(runTimeTicks.Value);
-        var estimatedBitrate = 8000000; // 8 Mbps
+        var estimatedBitrate = 8000000;
         return (long)(durationSeconds * estimatedBitrate / 8);
     }
 
@@ -523,7 +641,7 @@ public class ContentDirectoryService
         var dlnaPort = _configuration["Dlna:Port"] ?? "8200";
         var streamUrl = $"http://{localIp}:{dlnaPort}/stream/{itemId}";
         
-        _logger.LogDebug("Generated proxy stream URL for item {ItemId}: {StreamUrl}", itemId, streamUrl);
+        _logger.LogTrace("Generated proxy stream URL for item {ItemId}: {StreamUrl}", itemId, streamUrl);
         return streamUrl;
     }
 
@@ -537,7 +655,6 @@ public class ContentDirectoryService
             {
                 if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !System.Net.IPAddress.IsLoopback(ip))
                 {
-                    _logger.LogDebug("Using local IP address: {IpAddress}", ip.ToString());
                     return ip.ToString();
                 }
             }
@@ -547,7 +664,6 @@ public class ContentDirectoryService
             _logger.LogWarning(ex, "Failed to get local IP address, using loopback");
         }
         
-        _logger.LogWarning("No non-loopback IP found, using 127.0.0.1");
         return "127.0.0.1";
     }
 
@@ -556,16 +672,22 @@ public class ContentDirectoryService
     {
         var escapedTitle = System.Security.SecurityElement.Escape(title);
         var albumArtUrl = itemId.HasValue ? GetAlbumArtUrl(itemId.Value) : "";
-        var albumArtXml = !string.IsNullOrEmpty(albumArtUrl) ?
-            $"<upnp:albumArtURI>{albumArtUrl}</upnp:albumArtURI>" : "";
+        
+        var additionalMetadata = "";
+        if (!string.IsNullOrEmpty(albumArtUrl))
+        {
+            additionalMetadata = $"<upnp:albumArtURI>{albumArtUrl}</upnp:albumArtURI>";
+        }
+
+        _logger.LogTrace("Creating container {Id} with {ChildCount} children", id, childCount);
 
         return _xmlTemplateService.GetTemplate("ContainerTemplate",
-            id,              // {0} - id
-            parentId,        // {1} - parentID
-            childCount,      // {2} - childCount
-            escapedTitle,    // {3} - title
-            upnpClass,       // {4} - upnp:class
-            albumArtXml      // {5} - album art
+            id,                 // {0} - id
+            parentId,           // {1} - parentID
+            childCount,         // {2} - childCount
+            escapedTitle,       // {3} - title
+            upnpClass,          // {4} - upnp:class
+            additionalMetadata  // {5} - additional metadata
         );
     }
 
@@ -608,10 +730,11 @@ public class ContentDirectoryService
             BaseItemDto_Type.Audio => "object.item.audioItem.musicTrack",
             BaseItemDto_Type.MusicAlbum => "object.container.album.musicAlbum",
             BaseItemDto_Type.MusicArtist => "object.container.person.musicArtist",
-            BaseItemDto_Type.MusicVideo => "object.item.videoItem",
+            BaseItemDto_Type.MusicVideo => "object.item.videoItem.musicVideoClip",
             BaseItemDto_Type.Photo => "object.item.imageItem.photo",
             BaseItemDto_Type.Video => "object.item.videoItem",
             BaseItemDto_Type.CollectionFolder => "object.container.storageFolder",
+            BaseItemDto_Type.Folder => "object.container.storageFolder",
             _ => "object.container.storageFolder"
         };
     }
@@ -647,7 +770,6 @@ public class ContentDirectoryService
         
         _logger.LogDebug("Created browse response with {NumberReturned} items, {TotalMatches} total", 
             numberReturned, totalMatches);
-        _logger.LogTrace("Browse response XML: {Response}", response);
         
         return response;
     }

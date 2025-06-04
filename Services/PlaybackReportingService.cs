@@ -2,7 +2,6 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Configuration;
 using System.Text;
 using System.Text.Json;
-using Jellyfin.Sdk.Generated.Models;
 using FinDLNA.Utilities;
 using FinDLNA.Models;
 using System.Collections.Concurrent;
@@ -16,9 +15,7 @@ public class PlaybackReportingService
     private readonly IConfiguration _configuration;
     private readonly HttpClient _httpClient;
     private readonly ConcurrentDictionary<string, PlaybackSession> _activeSessions = new();
-    private readonly ConcurrentDictionary<string, object> _sessionLocks = new();
-    private readonly ConcurrentDictionary<string, byte> _stoppingSessions = new();
-    private readonly object _globalLock = new object();
+    private readonly ConcurrentDictionary<string, bool> _stopInProgress = new();
 
     public PlaybackReportingService(
         ILogger<PlaybackReportingService> logger,
@@ -30,37 +27,22 @@ public class PlaybackReportingService
         _httpClient = httpClient;
     }
 
-    // MARK: IsConfigured
     private bool IsConfigured => !string.IsNullOrEmpty(_configuration["Jellyfin:AccessToken"]) &&
                                !string.IsNullOrEmpty(_configuration["Jellyfin:ServerUrl"]);
-
-    // MARK: GetSessionLock
-    private object GetSessionLock(string sessionId)
-    {
-        return _sessionLocks.GetOrAdd(sessionId, _ => new object());
-    }
 
     // MARK: StartPlaybackAsync
     public async Task<string?> StartPlaybackAsync(Guid itemId, string? userAgent = null, string? clientEndpoint = null, long? startPositionTicks = null)
     {
+        if (!IsConfigured) return null;
+
         try
         {
-            if (!IsConfigured)
-            {
-                _logger.LogWarning("Jellyfin not configured for playback reporting");
-                return null;
-            }
-
             var sessionId = Guid.NewGuid().ToString();
             var userId = _configuration["Jellyfin:UserId"];
             var accessToken = _configuration["Jellyfin:AccessToken"];
             var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
 
-            if (string.IsNullOrEmpty(userId))
-            {
-                _logger.LogWarning("Missing Jellyfin UserId for playback reporting");
-                return null;
-            }
+            if (string.IsNullOrEmpty(userId)) return null;
 
             var actualStartPosition = startPositionTicks ?? 0L;
             
@@ -78,16 +60,8 @@ public class PlaybackReportingService
                 StartTimeTicks = actualStartPosition,
                 PositionTicks = actualStartPosition,
                 VolumeLevel = 100,
-                Brightness = 100,
-                AspectRatio = "16:9",
-                PlayMethod = startPositionTicks.HasValue ? "Transcode" : "DirectPlay",
+                PlayMethod = "DirectPlay",
                 PlaySessionId = sessionId,
-                PlaylistItemId = sessionId,
-                MediaStreams = new object[0],
-                PlaybackStartTimeTicks = DateTimeOffset.UtcNow.Ticks,
-                SubtitleStreamIndex = (int?)null,
-                AudioStreamIndex = (int?)null,
-                LiveStreamId = (string?)null,
                 EventName = "playbackstart"
             };
 
@@ -97,8 +71,6 @@ public class PlaybackReportingService
             var url = $"{serverUrl}/Sessions/Playing";
             var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
             request.Headers.Add("X-Emby-Token", accessToken);
-
-            _logger.LogDebug("PLAYBACK START REQUEST: {Json}", json);
 
             var response = await _httpClient.SendAsync(request);
 
@@ -118,8 +90,8 @@ public class PlaybackReportingService
 
                 _activeSessions[sessionId] = session;
 
-                _logger.LogInformation("PLAYBACK STARTED: Session {SessionId} for item {ItemId} at position {Position}ms from {Client}", 
-                    sessionId, itemId, TimeConversionUtil.TicksToMilliseconds(actualStartPosition), clientEndpoint);
+                _logger.LogInformation("PLAYBACK STARTED: Session {SessionId} for item {ItemId} at {Position}ms", 
+                    sessionId, itemId, TimeConversionUtil.TicksToMilliseconds(actualStartPosition));
 
                 return sessionId;
             }
@@ -143,71 +115,24 @@ public class PlaybackReportingService
     {
         if (!_activeSessions.TryGetValue(sessionId, out var session))
         {
-            _logger.LogDebug("Session {SessionId} not found for progress update", sessionId);
+            _logger.LogTrace("Session {SessionId} not found for progress update", sessionId);
             return;
         }
 
-        var sessionLock = GetSessionLock(sessionId);
-        
-        // MARK: Create a copy of the session data for the update
-        string userId;
-        Guid itemId;
-        long actualPosition;
-        
-        lock (sessionLock)
-        {
-            if (!_activeSessions.TryGetValue(sessionId, out session))
-            {
-                _logger.LogDebug("Session {SessionId} was removed during progress update", sessionId);
-                return;
-            }
-
-            // MARK: Validate position is reasonable
-            var timeSinceLastUpdate = DateTimeOffset.UtcNow - session.LastProgressUpdate;
-            var maxReasonableAdvance = TimeConversionUtil.SecondsToTicks(timeSinceLastUpdate.TotalSeconds * 2); // 2x playback speed max
-            
-            if (positionTicks > session.LastPositionTicks + maxReasonableAdvance)
-            {
-                _logger.LogWarning("Position jump too large: {Current}ms -> {New}ms (max allowed: {Max}ms)",
-                    TimeConversionUtil.TicksToMilliseconds(session.LastPositionTicks),
-                    TimeConversionUtil.TicksToMilliseconds(positionTicks),
-                    TimeConversionUtil.TicksToMilliseconds(session.LastPositionTicks + maxReasonableAdvance));
-                
-                // MARK: Cap the position to a reasonable advance
-                actualPosition = session.LastPositionTicks + maxReasonableAdvance;
-            }
-            else
-            {
-                actualPosition = positionTicks;
-            }
-
-            session.LastProgressUpdate = DateTimeOffset.UtcNow;
-            session.LastPositionTicks = actualPosition;
-            session.IsPaused = isPaused;
-            session.PauseTime = isPaused ? DateTimeOffset.UtcNow : null;
-
-            userId = session.UserId;
-            itemId = session.ItemId;
-        }
+        if (!IsConfigured) return;
 
         try
         {
-            if (!IsConfigured)
-            {
-                _logger.LogWarning("Jellyfin not configured for progress update");
-                return;
-            }
-
             var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
             var accessToken = _configuration["Jellyfin:AccessToken"];
 
             var progressInfo = new
             {
-                UserId = userId,
-                ItemId = itemId,
+                UserId = session.UserId,
+                ItemId = session.ItemId,
                 SessionId = sessionId,
-                MediaSourceId = itemId.ToString(),
-                PositionTicks = actualPosition,
+                MediaSourceId = session.ItemId.ToString(),
+                PositionTicks = positionTicks,
                 IsPaused = isPaused,
                 IsMuted = false,
                 VolumeLevel = 100,
@@ -215,9 +140,7 @@ public class PlaybackReportingService
                 RepeatMode = "RepeatNone",
                 PlayMethod = "DirectPlay",
                 PlaySessionId = sessionId,
-                PlaylistItemId = sessionId,
-                EventName = isPaused ? "pause" : "timeupdate",
-                LiveStreamId = (string?)null
+                EventName = isPaused ? "pause" : "timeupdate"
             };
 
             var json = JsonSerializer.Serialize(progressInfo);
@@ -227,15 +150,17 @@ public class PlaybackReportingService
             var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
             request.Headers.Add("X-Emby-Token", accessToken);
 
-            _logger.LogDebug("PROGRESS UPDATE: Position={Position}ms, IsPaused={IsPaused}", 
-                TimeConversionUtil.TicksToMilliseconds(actualPosition), isPaused);
-
             var response = await _httpClient.SendAsync(request);
 
             if (response.IsSuccessStatusCode)
             {
-                _logger.LogDebug("PROGRESS UPDATED: Session {SessionId} at {Position}ms, paused: {IsPaused}", 
-                    sessionId, TimeConversionUtil.TicksToMilliseconds(actualPosition), isPaused);
+                // Update session data
+                session.LastProgressUpdate = DateTimeOffset.UtcNow;
+                session.LastPositionTicks = positionTicks;
+                session.IsPaused = isPaused;
+
+                _logger.LogDebug("PROGRESS REPORTED: Session {SessionId} at {Position}ms (Paused: {IsPaused})", 
+                    sessionId, TimeConversionUtil.TicksToMilliseconds(positionTicks), isPaused);
             }
             else
             {
@@ -254,8 +179,7 @@ public class PlaybackReportingService
     public async Task PausePlaybackAsync(string sessionId, long positionTicks)
     {
         await UpdatePlaybackProgressAsync(sessionId, positionTicks, isPaused: true);
-        
-        _logger.LogInformation("Paused playback session {SessionId} at position {Position}ms", 
+        _logger.LogInformation("PAUSED: Session {SessionId} at {Position}ms", 
             sessionId, TimeConversionUtil.TicksToMilliseconds(positionTicks));
     }
 
@@ -263,59 +187,44 @@ public class PlaybackReportingService
     public async Task ResumePlaybackAsync(string sessionId, long positionTicks)
     {
         await UpdatePlaybackProgressAsync(sessionId, positionTicks, isPaused: false);
-        
-        _logger.LogInformation("Resumed playback session {SessionId} from position {Position}ms", 
+        _logger.LogInformation("RESUMED: Session {SessionId} at {Position}ms", 
             sessionId, TimeConversionUtil.TicksToMilliseconds(positionTicks));
     }
 
     // MARK: StopPlaybackAsync
     public async Task StopPlaybackAsync(string sessionId, long? finalPositionTicks = null, bool markAsWatched = false)
     {
-        // MARK: Use a concurrent dictionary to track sessions being stopped
-        if (!_stoppingSessions.TryAdd(sessionId, byte.MinValue))
+        // Prevent duplicate stop calls
+        if (!_stopInProgress.TryAdd(sessionId, true))
         {
-            _logger.LogDebug("Session {SessionId} is already being stopped", sessionId);
+            _logger.LogTrace("Stop already in progress for session {SessionId}", sessionId);
             return;
         }
 
         try
         {
-            var sessionLock = GetSessionLock(sessionId);
-            PlaybackSession? session = null;
-
-            lock (sessionLock)
+            if (!_activeSessions.TryRemove(sessionId, out var session))
             {
-                if (!_activeSessions.TryRemove(sessionId, out session))
-                {
-                    _logger.LogDebug("Session {SessionId} not found or already removed for stop", sessionId);
-                    return;
-                }
-            }
-            if (!IsConfigured)
-            {
-                _logger.LogWarning("Jellyfin not configured for stop playback");
+                _logger.LogTrace("Session {SessionId} not found for stop", sessionId);
                 return;
             }
 
+            if (!IsConfigured) return;
+
             var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
             var accessToken = _configuration["Jellyfin:AccessToken"];
-
             var positionTicks = finalPositionTicks ?? session.LastPositionTicks;
-            var playedDuration = DateTimeOffset.UtcNow - session.StartTime;
 
             var stopInfo = new
             {
                 UserId = session.UserId,
                 ItemId = session.ItemId,
-                SessionId = session.SessionId,
+                SessionId = sessionId,
                 MediaSourceId = session.ItemId.ToString(),
                 PositionTicks = positionTicks,
-                PlaySessionId = session.SessionId,
-                PlaylistItemId = session.SessionId,
+                PlaySessionId = sessionId,
                 Failed = false,
-                NextMediaType = "Unknown",
-                PlayMethod = "DirectPlay",
-                LiveStreamId = (string?)null
+                PlayMethod = "DirectPlay"
             };
 
             var json = JsonSerializer.Serialize(stopInfo);
@@ -325,14 +234,13 @@ public class PlaybackReportingService
             var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
             request.Headers.Add("X-Emby-Token", accessToken);
 
-            _logger.LogDebug("PLAYBACK STOP REQUEST: {Json}", json);
-
             var response = await _httpClient.SendAsync(request);
 
             if (response.IsSuccessStatusCode)
             {
-                _logger.LogInformation("PLAYBACK STOPPED: Session {SessionId} for item {ItemId} - Duration: {Duration}, Final Position: {Position}ms, Client: {Client}", 
-                    sessionId, session.ItemId, playedDuration, TimeConversionUtil.TicksToMilliseconds(positionTicks), session.ClientEndpoint);
+                var playedDuration = DateTimeOffset.UtcNow - session.StartTime;
+                _logger.LogInformation("PLAYBACK STOPPED: Session {SessionId} for item {ItemId} - Duration: {Duration}, Final Position: {Position}ms", 
+                    sessionId, session.ItemId, playedDuration, TimeConversionUtil.TicksToMilliseconds(positionTicks));
 
                 if (markAsWatched)
                 {
@@ -352,12 +260,7 @@ public class PlaybackReportingService
         }
         finally
         {
-            _stoppingSessions.TryRemove(sessionId, out _);
-            
-            lock (_globalLock)
-            {
-                _sessionLocks.TryRemove(sessionId, out _);
-            }
+            _stopInProgress.TryRemove(sessionId, out _);
         }
     }
 
@@ -366,11 +269,7 @@ public class PlaybackReportingService
     {
         try
         {
-            if (!IsConfigured)
-            {
-                _logger.LogWarning("Jellyfin not configured for mark as watched");
-                return;
-            }
+            if (!IsConfigured) return;
 
             var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
             var accessToken = _configuration["Jellyfin:AccessToken"];
@@ -384,12 +283,6 @@ public class PlaybackReportingService
             if (response.IsSuccessStatusCode)
             {
                 _logger.LogInformation("Marked item {ItemId} as watched for user {UserId}", itemId, userId);
-            }
-            else
-            {
-                var errorContent = await response.Content.ReadAsStringAsync();
-                _logger.LogWarning("Failed to mark item as watched: {StatusCode} - {Content}", 
-                    response.StatusCode, errorContent);
             }
         }
         catch (Exception ex)
@@ -407,28 +300,21 @@ public class PlaybackReportingService
     // MARK: CleanupStaleSessionsAsync
     public async Task CleanupStaleSessionsAsync()
     {
-        var staleThreshold = TimeSpan.FromMinutes(15);
-        var pausedThreshold = TimeSpan.FromHours(2);
+        var staleThreshold = TimeSpan.FromHours(2);
         var now = DateTimeOffset.UtcNow;
         var staleSessions = new List<string>();
 
-        // MARK: Identify stale sessions
         foreach (var kvp in _activeSessions)
         {
             var session = kvp.Value;
             var timeSinceUpdate = now - session.LastProgressUpdate;
             
-            var threshold = session.IsPaused ? pausedThreshold : staleThreshold;
-            
-            if (timeSinceUpdate > threshold)
+            if (timeSinceUpdate > staleThreshold)
             {
                 staleSessions.Add(kvp.Key);
-                _logger.LogInformation("Session {SessionId} stale for {Duration} (paused: {IsPaused})", 
-                    kvp.Key, timeSinceUpdate, session.IsPaused);
             }
         }
 
-        // MARK: Clean up stale sessions
         foreach (var sessionId in staleSessions)
         {
             _logger.LogInformation("Cleaning up stale session {SessionId}", sessionId);
@@ -436,20 +322,8 @@ public class PlaybackReportingService
         }
     }
 
-    // MARK: GetSessionByItemAsync
-    public Task<PlaybackSession?> GetSessionByItemAsync(Guid itemId)
-    {
-        var session = _activeSessions.Values.FirstOrDefault(s => s.ItemId == itemId);
-        return Task.FromResult(session);
-    }
-
-    // MARK: SessionExists
-    public bool SessionExists(string sessionId)
-    {
-        return _activeSessions.ContainsKey(sessionId);
-    }
-
-    // MARK: GetSessionAsync
+    public bool SessionExists(string sessionId) => _activeSessions.ContainsKey(sessionId);
+    
     public Task<PlaybackSession?> GetSessionAsync(string sessionId)
     {
         _activeSessions.TryGetValue(sessionId, out var session);
