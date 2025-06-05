@@ -1,3 +1,5 @@
+using Jellyfin.Sdk.Generated.Models;
+
 namespace FinDLNA.Models;
 
 // MARK: StreamRequest

@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FinDLNA Diagnostics</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a1a;
+            color: #fff;
+            line-height: 1.6;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: #2a2a2a;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #00a4dc, #0082b3);
+            padding: 20px;
+            color: white;
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 2rem;
+        }
+
+        .header p {
+            margin: 5px 0 0;
+            opacity: 0.9;
+        }
+
+        .content {
+            padding: 20px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: background-color 0.2s;
+            text-decoration: none;
+            display: inline-block;
+        }
+
+        .btn-primary {
+            background: #00a4dc;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #0082b3;
+        }
+
+        .btn-secondary {
+            background: #666;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #555;
+        }
+
+        .btn:disabled {
+            background: #444;
+            cursor: not-allowed;
+        }
+
+        .summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .summary-card {
+            background: #333;
+            padding: 15px;
+            border-radius: 6px;
+            text-align: center;
+        }
+
+        .summary-number {
+            font-size: 2rem;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .passed { color: #4CAF50; }
+        .warning { color: #FF9800; }
+        .failed { color: #F44336; }
+
+        .test-results {
+            margin-top: 20px;
+        }
+
+        .test-item {
+            background: #333;
+            margin-bottom: 10px;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        .test-header {
+            padding: 15px;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .test-header:hover {
+            background: #3a3a3a;
+        }
+
+        .test-status {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+            font-weight: bold;
+        }
+
+        .test-details {
+            padding: 0 15px 15px;
+            border-top: 1px solid #444;
+            display: none;
+            white-space: pre-wrap;
+            font-family: monospace;
+            font-size: 0.9rem;
+        }
+
+        .test-details.expanded {
+            display: block;
+        }
+
+        .recommendations {
+            background: #2a3a4a;
+            border-left: 4px solid #00a4dc;
+            padding: 15px;
+            margin-top: 20px;
+            border-radius: 0 6px 6px 0;
+        }
+
+        .recommendations h3 {
+            margin-bottom: 10px;
+            color: #00a4dc;
+        }
+
+        .recommendations ul {
+            margin-left: 20px;
+        }
+
+        .recommendations li {
+            margin-bottom: 5px;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+        }
+
+        .spinner {
+            border: 3px solid #333;
+            border-top: 3px solid #00a4dc;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .error {
+            background: #4a2a2a;
+            border-left: 4px solid #F44336;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 0 6px 6px 0;
+        }
+
+        .back-link {
+            margin-bottom: 20px;
+        }
+
+        @media (max-width: 768px) {
+            .controls {
+                flex-direction: column;
+            }
+            
+            .btn {
+                width: 100%;
+                text-align: center;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔧 FinDLNA Diagnostics</h1>
+            <p>System health check and troubleshooting</p>
+        </div>
+        
+        <div class="content">
+            <div class="back-link">
+                <a href="/" class="btn btn-secondary">← Back to Main</a>
+            </div>
+
+            <div class="controls">
+                <button id="runDiagnostics" class="btn btn-primary">Run Full Diagnostics</button>
+                <button id="runSummary" class="btn btn-secondary">Quick Summary</button>
+                <button id="clearResults" class="btn btn-secondary">Clear Results</button>
+            </div>
+
+            <div id="loadingIndicator" class="loading" style="display: none;">
+                <div class="spinner"></div>
+                <p>Running diagnostics...</p>
+            </div>
+
+            <div id="results" style="display: none;">
+                <div class="summary">
+                    <div class="summary-card">
+                        <div id="passedCount" class="summary-number passed">0</div>
+                        <div>Passed</div>
+                    </div>
+                    <div class="summary-card">
+                        <div id="warningCount" class="summary-number warning">0</div>
+                        <div>Warnings</div>
+                    </div>
+                    <div class="summary-card">
+                        <div id="failedCount" class="summary-number failed">0</div>
+                        <div>Failed</div>
+                    </div>
+                </div>
+
+                <div id="testResults" class="test-results"></div>
+                <div id="recommendations" class="recommendations" style="display: none;"></div>
+            </div>
+
+            <div id="errorMessage" class="error" style="display: none;"></div>
+        </div>
+    </div>
+
+    <script>
+        const runDiagnosticsBtn = document.getElementById('runDiagnostics');
+        const runSummaryBtn = document.getElementById('runSummary');
+        const clearResultsBtn = document.getElementById('clearResults');
+        const loadingIndicator = document.getElementById('loadingIndicator');
+        const results = document.getElementById('results');
+        const errorMessage = document.getElementById('errorMessage');
+
+        runDiagnosticsBtn.addEventListener('click', () => runDiagnostics(false));
+        runSummaryBtn.addEventListener('click', () => runDiagnostics(true));
+        clearResultsBtn.addEventListener('click', clearResults);
+
+        async function runDiagnostics(summaryOnly = false) {
+            showLoading();
+            
+            try {
+                const endpoint = summaryOnly ? '/api/diagnostic/summary' : '/api/diagnostic/run';
+                const response = await fetch(endpoint);
+                const data = await response.json();
+                
+                if (data.success) {
+                    if (summaryOnly) {
+                        displaySummary(data);
+                    } else {
+                        displayResults(data.report);
+                    }
+                } else {
+                    showError('Diagnostic failed: ' + (data.error || 'Unknown error'));
+                }
+            } catch (error) {
+                showError('Failed to run diagnostics: ' + error.message);
+            }
+        }
+
+        function showLoading() {
+            loadingIndicator.style.display = 'block';
+            results.style.display = 'none';
+            errorMessage.style.display = 'none';
+            runDiagnosticsBtn.disabled = true;
+            runSummaryBtn.disabled = true;
+        }
+
+        function hideLoading() {
+            loadingIndicator.style.display = 'none';
+            runDiagnosticsBtn.disabled = false;
+            runSummaryBtn.disabled = false;
+        }
+
+        function displayResults(report) {
+            hideLoading();
+            
+            document.getElementById('passedCount').textContent = report.summary.passed;
+            document.getElementById('warningCount').textContent = report.summary.warnings;
+            document.getElementById('failedCount').textContent = report.summary.failed;
+
+            const testResults = document.getElementById('testResults');
+            testResults.innerHTML = '';
+
+            report.tests.forEach(test => {
+                const testItem = createTestItem(test);
+                testResults.appendChild(testItem);
+            });
+
+            if (report.recommendations && report.recommendations.length > 0) {
+                displayRecommendations(report.recommendations);
+            }
+
+            results.style.display = 'block';
+        }
+
+        function displaySummary(data) {
+            hideLoading();
+            
+            document.getElementById('passedCount').textContent = data.passed;
+            document.getElementById('warningCount').textContent = data.warnings;
+            document.getElementById('failedCount').textContent = data.failed;
+
+            const testResults = document.getElementById('testResults');
+            testResults.innerHTML = `<pre style="background: #333; padding: 15px; border-radius: 6px; overflow-x: auto;">${data.summary}</pre>`;
+
+            results.style.display = 'block';
+        }
+
+        function createTestItem(test) {
+            const testItem = document.createElement('div');
+            testItem.className = 'test-item';
+
+            const statusClass = test.status.toLowerCase();
+            const statusText = test.status;
+
+            testItem.innerHTML = `
+                <div class="test-header" onclick="toggleTestDetails(this)">
+                    <div>
+                        <strong>${test.name}</strong>
+                        <div style="margin-top: 5px; font-size: 0.9rem; opacity: 0.8;">${test.message}</div>
+                    </div>
+                    <span class="test-status ${statusClass}">${statusText}</span>
+                </div>
+                <div class="test-details">${test.details || 'No additional details'}</div>
+            `;
+
+            return testItem;
+        }
+
+        function toggleTestDetails(header) {
+            const details = header.nextElementSibling;
+            details.classList.toggle('expanded');
+        }
+
+        function displayRecommendations(recommendations) {
+            const recommendationsDiv = document.getElementById('recommendations');
+            
+            if (recommendations.length > 0) {
+                recommendationsDiv.innerHTML = `
+                    <h3>💡 Recommendations</h3>
+                    <ul>${recommendations.map(rec => `<li>${rec}</li>`).join('')}</ul>
+                `;
+                recommendationsDiv.style.display = 'block';
+            } else {
+                recommendationsDiv.style.display = 'none';
+            }
+        }
+
+        function showError(message) {
+            hideLoading();
+            errorMessage.textContent = message;
+            errorMessage.style.display = 'block';
+            results.style.display = 'none';
+        }
+
+        function clearResults() {
+            results.style.display = 'none';
+            errorMessage.style.display = 'none';
+            document.getElementById('recommendations').style.display = 'none';
+        }
+
+        // Auto-run summary on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            runDiagnostics(true);
+        });
+    </script>
+</body>
+</html>

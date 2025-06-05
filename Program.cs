@@ -7,12 +7,10 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Options;
-using Microsoft.EntityFrameworkCore;
 using Microsoft.Kiota.Abstractions.Authentication;
 using Jellyfin.Sdk;
 using FinDLNA.Services;
 using FinDLNA.Models;
-using FinDLNA.Data;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -21,14 +19,6 @@ builder.Services.Configure<JellyfinClientOptions>(
 
 builder.Services.AddControllers();
 builder.Services.AddHttpClient();
-
-// MARK: Database configuration
-builder.Services.AddDbContext<DlnaContext>(options =>
-{
-    var connectionString = builder.Configuration.GetConnectionString("DefaultConnection") 
-        ?? "Data Source=findlna.db";
-    options.UseSqlite(connectionString);
-});
 
 // MARK: Jellyfin SDK setup
 builder.Services.AddSingleton(sp =>
@@ -67,51 +57,57 @@ builder.Services.AddSingleton<JellyfinApiClient>(sp =>
 });
 
 // MARK: Service registration - ORDER MATTERS!
-builder.Services.AddSingleton<XmlTemplateService>(); // MARK: Must be registered first
-builder.Services.AddScoped<DeviceProfileService>();
+builder.Services.AddSingleton<XmlTemplateService>();
+builder.Services.AddSingleton<DeviceProfileService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<JellyfinService>();
-builder.Services.AddSingleton<SsdpService>(); // MARK: Now depends on XmlTemplateService
-builder.Services.AddScoped<ContentDirectoryService>();
+builder.Services.AddSingleton<SsdpService>();
+builder.Services.AddSingleton<ContentDirectoryService>();
 builder.Services.AddSingleton<PlaybackReportingService>();
 builder.Services.AddSingleton<StreamingService>();
 builder.Services.AddSingleton<DlnaService>();
+builder.Services.AddSingleton<DiagnosticService>(); // MARK: Add DiagnosticService
 builder.Services.AddHostedService<DlnaBackgroundService>();
 
 var app = builder.Build();
 
-// MARK: Database initialization
+// MARK: Test services on startup
 using (var scope = app.Services.CreateScope())
 {
-    var context = scope.ServiceProvider.GetRequiredService<DlnaContext>();
-    var dbLogger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
+    var logger = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
     
-    try
-    {
-        await context.Database.EnsureCreatedAsync();
-        dbLogger.LogInformation("Database initialized successfully");
-        
-        var deviceProfileService = scope.ServiceProvider.GetRequiredService<DeviceProfileService>();
-        await deviceProfileService.InitializeDefaultProfilesAsync();
-        dbLogger.LogInformation("Device profiles initialized");
-    }
-    catch (Exception ex)
-    {
-        dbLogger.LogError(ex, "Failed to initialize database");
-    }
-
-    // MARK: Test XML Template Service
     try 
     {
         var xmlService = scope.ServiceProvider.GetRequiredService<XmlTemplateService>();
         var testTemplate = xmlService.GetTemplate("BrowseResponse", "test", 1, 1);
-        dbLogger.LogInformation("XmlTemplateService working - template length: {Length}", testTemplate.Length);
-        dbLogger.LogDebug("Test template content: {Content}", testTemplate.Substring(0, Math.Min(200, testTemplate.Length)));
+        logger.LogInformation("XmlTemplateService working - template length: {Length}", testTemplate.Length);
+        logger.LogDebug("Test template content: {Content}", testTemplate.Substring(0, Math.Min(200, testTemplate.Length)));
     }
     catch (Exception ex)
     {
-        dbLogger.LogError(ex, "XmlTemplateService failed to load templates: {Error}", ex.Message);
-        dbLogger.LogError("This will cause DLNA browsing to fail - check Templates folder and .csproj embedded resources");
+        logger.LogError(ex, "XmlTemplateService failed to load templates: {Error}", ex.Message);
+        logger.LogError("This will cause DLNA browsing to fail - check Templates folder and .csproj embedded resources");
+    }
+
+    try
+    {
+        var deviceProfileService = scope.ServiceProvider.GetRequiredService<DeviceProfileService>();
+        var testProfile = await deviceProfileService.GetProfileAsync("SEC_HHP_Samsung/1.0", null, "Samsung", "Smart TV", null);
+        logger.LogInformation("DeviceProfileService working - created profile: {ProfileName}", testProfile?.Name ?? "None");
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "DeviceProfileService failed to initialize");
+    }
+
+    try
+    {
+        var diagnosticService = scope.ServiceProvider.GetRequiredService<DiagnosticService>();
+        logger.LogInformation("DiagnosticService registered successfully");
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "DiagnosticService failed to initialize");
     }
 }
 
@@ -132,7 +128,6 @@ public class DlnaBackgroundService : BackgroundService
     private readonly JellyfinService _jellyfinService;
     private readonly PlaybackReportingService _playbackReportingService;
     private readonly ILogger<DlnaBackgroundService> _logger;
-    private readonly IServiceProvider _serviceProvider;
     private readonly IConfiguration _configuration;
     private Timer? _healthCheckTimer;
     private Timer? _cleanupTimer;
@@ -142,14 +137,12 @@ public class DlnaBackgroundService : BackgroundService
         JellyfinService jellyfinService,
         PlaybackReportingService playbackReportingService,
         ILogger<DlnaBackgroundService> logger,
-        IServiceProvider serviceProvider,
         IConfiguration configuration)
     {
         _dlnaService = dlnaService;
         _jellyfinService = jellyfinService;
         _playbackReportingService = playbackReportingService;
         _logger = logger;
-        _serviceProvider = serviceProvider;
         _configuration = configuration;
     }
 
