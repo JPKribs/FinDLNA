@@ -2,35 +2,29 @@ using System;
 using System.Net;
 using System.Net.Http;
 using System.Threading.Tasks;
-using FinDLNA.Models;
-using FinDLNA.Utilities;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Jellyfin.Sdk.Generated.Models;
 
 namespace FinDLNA.Services;
 
-// MARK: Simplified StreamingService
 public class StreamingService
 {
     private readonly ILogger<StreamingService> _logger;
     private readonly IConfiguration _configuration;
     private readonly JellyfinService _jellyfinService;
     private readonly DeviceProfileService _deviceProfileService;
-    private readonly PlaybackReportingService _playbackReportingService;
 
     public StreamingService(
         ILogger<StreamingService> logger,
         IConfiguration configuration,
         JellyfinService jellyfinService,
-        DeviceProfileService deviceProfileService,
-        PlaybackReportingService playbackReportingService)
+        DeviceProfileService deviceProfileService)
     {
         _logger = logger;
         _configuration = configuration;
         _jellyfinService = jellyfinService;
         _deviceProfileService = deviceProfileService;
-        _playbackReportingService = playbackReportingService;
     }
 
     // MARK: HandleStreamRequest
@@ -47,7 +41,8 @@ public class StreamingService
             var userAgent = context.Request.UserAgent ?? "";
             var clientEndpoint = context.Request.RemoteEndPoint?.ToString() ?? "";
 
-            _logger.LogInformation("STREAM REQUEST: Item {ItemId} from {UserAgent}", itemId, userAgent);
+            _logger.LogInformation("STREAM REQUEST: Item {ItemId} from {UserAgent} at {ClientEndpoint}", 
+                itemId, userAgent, clientEndpoint);
 
             var item = await _jellyfinService.GetItemAsync(guid);
             if (item == null)
@@ -59,9 +54,10 @@ public class StreamingService
             var deviceProfile = await _deviceProfileService.GetProfileAsync(userAgent);
             var streamUrl = GetStreamUrl(guid, deviceProfile, context.Request.Headers["Range"]);
 
-            var sessionId = await _playbackReportingService.StartPlaybackAsync(guid, userAgent, clientEndpoint);
+            _logger.LogDebug("Streaming {ItemName} ({ItemType}) to {UserAgent}", 
+                item.Name, item.Type, userAgent);
 
-            await ProxyStreamAsync(context, streamUrl, sessionId, guid);
+            await ProxyStreamAsync(context, streamUrl, guid);
         }
         catch (Exception ex)
         {
@@ -87,12 +83,30 @@ public class StreamingService
             queryParams.Add($"MaxStreamingBitrate={deviceProfile.MaxStreamingBitrate.Value}");
         }
 
+        if (deviceProfile?.Name != null)
+        {
+            if (deviceProfile.Name.Contains("Samsung"))
+            {
+                queryParams.Add("EnableAutoStreamCopy=true");
+            }
+            else if (deviceProfile.Name.Contains("Xbox"))
+            {
+                queryParams.Add("VideoCodec=h264");
+                queryParams.Add("AudioCodec=aac");
+            }
+        }
+
         var queryString = string.Join("&", queryParams);
-        return $"{serverUrl}/Videos/{itemId}/stream?{queryString}";
+        var url = $"{serverUrl}/Videos/{itemId}/stream?{queryString}";
+        
+        _logger.LogDebug("Generated stream URL for {ItemId} with profile {ProfileName}", 
+            itemId, deviceProfile?.Name ?? "Generic");
+        
+        return url;
     }
 
     // MARK: ProxyStreamAsync
-    private async Task ProxyStreamAsync(HttpListenerContext context, string streamUrl, string? sessionId, Guid itemId)
+    private async Task ProxyStreamAsync(HttpListenerContext context, string streamUrl, Guid itemId)
     {
         using var httpClient = new HttpClient { Timeout = TimeSpan.FromHours(2) };
         
@@ -103,12 +117,15 @@ public class StreamingService
             if (context.Request.Headers["Range"] != null)
             {
                 request.Headers.Add("Range", context.Request.Headers["Range"]);
+                _logger.LogDebug("Range request: {Range}", context.Request.Headers["Range"]);
             }
 
-            var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
 
             if (!response.IsSuccessStatusCode)
             {
+                _logger.LogWarning("Jellyfin returned {StatusCode} for stream {ItemId}", 
+                    response.StatusCode, itemId);
                 await SendErrorResponse(context, response.StatusCode, "Stream unavailable");
                 return;
             }
@@ -129,25 +146,43 @@ public class StreamingService
                 }
             }
 
-            using var sourceStream = await response.Content.ReadAsStreamAsync();
-            await sourceStream.CopyToAsync(context.Response.OutputStream);
+            context.Response.AddHeader("Accept-Ranges", "bytes");
 
-            if (sessionId != null)
+            using var sourceStream = await response.Content.ReadAsStreamAsync();
+            var buffer = new byte[65536];
+            int bytesRead;
+            long totalBytes = 0;
+
+            while ((bytesRead = await sourceStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
             {
-                await _playbackReportingService.StopPlaybackAsync(sessionId);
+                await context.Response.OutputStream.WriteAsync(buffer, 0, bytesRead);
+                totalBytes += bytesRead;
             }
+
+            _logger.LogInformation("Stream completed for {ItemId}: {TotalBytes} bytes transferred", 
+                itemId, totalBytes);
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogWarning(ex, "Network error streaming {ItemId}", itemId);
+        }
+        catch (TaskCanceledException)
+        {
+            _logger.LogDebug("Stream cancelled for {ItemId} (client disconnected)", itemId);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Stream interrupted for item {ItemId}", itemId);
-            if (sessionId != null)
-            {
-                await _playbackReportingService.StopPlaybackAsync(sessionId);
-            }
+            _logger.LogWarning(ex, "Stream interrupted for {ItemId}", itemId);
         }
         finally
         {
-            try { context.Response.Close(); } catch { }
+            try 
+            { 
+                context.Response.Close(); 
+            } 
+            catch 
+            { 
+            }
         }
     }
 
@@ -162,6 +197,9 @@ public class StreamingService
             await context.Response.OutputStream.WriteAsync(buffer);
             context.Response.Close();
         }
-        catch { }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Error sending error response");
+        }
     }
 }

@@ -9,7 +9,6 @@ using Jellyfin.Sdk.Generated.Models;
 
 namespace FinDLNA.Services;
 
-// MARK: Enhanced JellyfinService
 public class JellyfinService
 {
     private readonly ILogger<JellyfinService> _logger;
@@ -356,55 +355,6 @@ public class JellyfinService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to get item {ItemId}", itemId);
-            return null;
-        }
-    }
-
-    // MARK: GetStreamUrlAsync
-    public string? GetStreamUrlAsync(Guid itemId, string? container = null, bool includeDurationHeaders = true)
-    {
-        if (!IsConfigured) 
-        {
-            _logger.LogWarning("GetStreamUrlAsync called but Jellyfin not configured");
-            return null;
-        }
-
-        try
-        {
-            var serverUrl = _configuration["Jellyfin:ServerUrl"]?.TrimEnd('/');
-            var accessToken = _configuration["Jellyfin:AccessToken"];
-
-            if (string.IsNullOrEmpty(serverUrl) || string.IsNullOrEmpty(accessToken))
-            {
-                _logger.LogError("Missing server URL or access token for stream URL generation");
-                return null;
-            }
-
-            var queryParams = new List<string>
-            {
-                $"X-Emby-Token={accessToken}"
-            };
-
-            if (!string.IsNullOrEmpty(container))
-            {
-                queryParams.Add($"Container={container}");
-            }
-
-            if (includeDurationHeaders)
-            {
-                queryParams.Add("EnableRedirection=false");
-                queryParams.Add("EnableRemoteMedia=false");
-            }
-
-            var queryString = string.Join("&", queryParams);
-            var streamUrl = $"{serverUrl}/Videos/{itemId}/stream?{queryString}";
-            
-            _logger.LogTrace("Generated stream URL for {ItemId}", itemId);
-            return streamUrl;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to get stream URL for item {ItemId}", itemId);
             return null;
         }
     }

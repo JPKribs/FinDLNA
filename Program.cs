@@ -18,6 +18,8 @@ builder.Services.Configure<JellyfinClientOptions>(
     builder.Configuration.GetSection("JellyfinClient"));
 
 builder.Services.AddControllers();
+builder.Services.AddProblemDetails();
+
 builder.Services.AddHttpClient();
 
 // MARK: Jellyfin SDK setup
@@ -56,22 +58,36 @@ builder.Services.AddSingleton<JellyfinApiClient>(sp =>
     return client;
 });
 
-// MARK: Service registration
+// MARK: Enhanced Service Registration
+builder.Services.AddSingleton<ContentBuilderService>();
 builder.Services.AddSingleton<XmlTemplateService>();
 builder.Services.AddSingleton<DeviceProfileService>();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<JellyfinService>();
 builder.Services.AddSingleton<SsdpService>();
 builder.Services.AddSingleton<ContentDirectoryService>();
-builder.Services.AddSingleton<PlaybackReportingService>();
 builder.Services.AddSingleton<StreamingService>();
 builder.Services.AddSingleton<DlnaService>();
 builder.Services.AddSingleton<DlnaMetadataBuilder>();
 builder.Services.AddSingleton<DlnaStreamUrlBuilder>();
 builder.Services.AddSingleton<DiagnosticService>();
+builder.Services.AddSingleton<ConfigurationValidator>();
 builder.Services.AddHostedService<DlnaBackgroundService>();
 
 var app = builder.Build();
+
+// MARK: Configuration Validation
+try
+{
+    var validator = app.Services.GetRequiredService<ConfigurationValidator>();
+    validator.ValidateConfiguration(app.Configuration);
+}
+catch (InvalidOperationException ex)
+{
+    var logger = app.Services.GetRequiredService<ILogger<Program>>();
+    logger.LogCritical(ex, "Configuration validation failed: {Message}", ex.Message);
+    throw;
+}
 
 // MARK: Test services on startup
 using (var scope = app.Services.CreateScope())
@@ -110,6 +126,16 @@ using (var scope = app.Services.CreateScope())
     catch (Exception ex)
     {
         logger.LogError(ex, "DiagnosticService failed to initialize");
+    }
+
+    try
+    {
+        var contentBuilderService = scope.ServiceProvider.GetRequiredService<ContentBuilderService>();
+        logger.LogInformation("ContentBuilderService registered successfully");
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "ContentBuilderService failed to initialize");
     }
 }
 

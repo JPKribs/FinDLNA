@@ -9,7 +9,6 @@ public class DlnaBackgroundService : BackgroundService
 {
     private readonly DlnaService _dlnaService;
     private readonly JellyfinService _jellyfinService;
-    private readonly PlaybackReportingService _playbackReportingService;
     private readonly ILogger<DlnaBackgroundService> _logger;
     private readonly IConfiguration _configuration;
     private Timer? _healthCheckTimer;
@@ -18,13 +17,11 @@ public class DlnaBackgroundService : BackgroundService
     public DlnaBackgroundService(
         DlnaService dlnaService, 
         JellyfinService jellyfinService,
-        PlaybackReportingService playbackReportingService,
         ILogger<DlnaBackgroundService> logger,
         IConfiguration configuration)
     {
         _dlnaService = dlnaService;
         _jellyfinService = jellyfinService;
-        _playbackReportingService = playbackReportingService;
         _logger = logger;
         _configuration = configuration;
     }
@@ -75,7 +72,6 @@ public class DlnaBackgroundService : BackgroundService
         _logger.LogInformation("DLNA service started successfully");
         
         StartHealthMonitoring(stoppingToken);
-        StartSessionCleanup(stoppingToken);
         
         while (!stoppingToken.IsCancellationRequested && _jellyfinService.IsConfigured)
         {
@@ -111,30 +107,6 @@ public class DlnaBackgroundService : BackgroundService
                 _logger.LogWarning(ex, "Health check timer error");
             }
         }, null, TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(2));
-    }
-
-    // MARK: StartSessionCleanup
-    private void StartSessionCleanup(CancellationToken stoppingToken)
-    {
-        _cleanupTimer = new Timer(async _ =>
-        {
-            if (stoppingToken.IsCancellationRequested) return;
-
-            try
-            {
-                await _playbackReportingService.CleanupStaleSessionsAsync();
-                
-                var activeSessions = await _playbackReportingService.GetActiveSessionsAsync();
-                if (activeSessions.Count > 0)
-                {
-                    _logger.LogDebug("Active playback sessions: {Count}", activeSessions.Count);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Session cleanup error");
-            }
-        }, null, TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
     }
 
     // MARK: IsServiceHealthy
