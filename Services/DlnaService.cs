@@ -7,9 +7,9 @@ using FinDLNA.Services;
 namespace FinDLNA.Services;
 
 // MARK: DlnaService
-public class DlnaService : IDisposable
+public class DLNAService : IDisposable
 {
-    private readonly ILogger<DlnaService> _logger;
+    private readonly ILogger<DLNAService> _logger;
     private readonly IConfiguration _configuration;
     private readonly SsdpService _ssdpService;
     private readonly ContentDirectoryService _contentDirectoryService;
@@ -19,8 +19,8 @@ public class DlnaService : IDisposable
     private HttpListener? _httpListener;
     private bool _isRunning;
 
-    public DlnaService(
-        ILogger<DlnaService> logger, 
+    public DLNAService(
+        ILogger<DLNAService> logger, 
         IConfiguration configuration,
         SsdpService ssdpService,
         ContentDirectoryService contentDirectoryService,

@@ -67,7 +67,7 @@ builder.Services.AddSingleton<JellyfinService>();
 builder.Services.AddSingleton<SsdpService>();
 builder.Services.AddSingleton<ContentDirectoryService>();
 builder.Services.AddSingleton<StreamingService>();
-builder.Services.AddSingleton<DlnaService>();
+builder.Services.AddSingleton<DLNAService>();
 builder.Services.AddSingleton<DlnaMetadataBuilder>();
 builder.Services.AddSingleton<DlnaStreamUrlBuilder>();
 builder.Services.AddSingleton<DiagnosticService>();
