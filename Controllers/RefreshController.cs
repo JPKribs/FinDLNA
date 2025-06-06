@@ -11,12 +11,12 @@ public class RefreshController : ControllerBase
 {
     private readonly ILogger<RefreshController> _logger;
     private readonly SsdpService _ssdpService;
-    private readonly DlnaService _dlnaService;
+    private readonly DLNAService _dlnaService;
 
     public RefreshController(
         ILogger<RefreshController> logger,
         SsdpService ssdpService,
-        DlnaService dlnaService)
+        DLNAService dlnaService)
     {
         _logger = logger;
         _ssdpService = ssdpService;
