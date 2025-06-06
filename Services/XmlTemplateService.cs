@@ -8,36 +8,11 @@ public class XmlTemplateService
 {
     private readonly ILogger<XmlTemplateService> _logger;
     private readonly Dictionary<string, string> _templates = new();
+    private readonly Assembly _assembly = Assembly.GetExecutingAssembly();
 
     public XmlTemplateService(ILogger<XmlTemplateService> logger)
     {
         _logger = logger;
-        LogAvailableResources(); // MARK: Debug helper
-    }
-
-    // MARK: LogAvailableResources
-    private void LogAvailableResources()
-    {
-        try
-        {
-            var assembly = Assembly.GetExecutingAssembly();
-            var resourceNames = assembly.GetManifestResourceNames();
-            
-            _logger.LogInformation("Available embedded resources:");
-            foreach (var resourceName in resourceNames)
-            {
-                _logger.LogInformation("  - {ResourceName}", resourceName);
-            }
-            
-            if (resourceNames.Length == 0)
-            {
-                _logger.LogError("No embedded resources found! Check your .csproj file.");
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error listing embedded resources");
-        }
     }
 
     // MARK: GetTemplate
@@ -45,19 +20,7 @@ public class XmlTemplateService
     {
         try
         {
-            if (!_templates.ContainsKey(templateName))
-            {
-                _templates[templateName] = LoadTemplate(templateName);
-            }
-
-            var template = _templates[templateName];
-            
-            if (string.IsNullOrEmpty(template))
-            {
-                _logger.LogError("Template {TemplateName} is empty after loading", templateName);
-                return CreateErrorTemplate(templateName);
-            }
-
+            var template = GetCachedTemplate(templateName);
             return args.Length > 0 ? string.Format(template, args) : template;
         }
         catch (Exception ex)
@@ -67,57 +30,74 @@ public class XmlTemplateService
         }
     }
 
+    // MARK: GetCachedTemplate
+    private string GetCachedTemplate(string templateName)
+    {
+        if (_templates.TryGetValue(templateName, out var cachedTemplate))
+        {
+            return cachedTemplate;
+        }
+
+        var template = LoadTemplate(templateName);
+        _templates[templateName] = template;
+        return template;
+    }
+
     // MARK: LoadTemplate
     private string LoadTemplate(string templateName)
     {
-        var assembly = Assembly.GetExecutingAssembly();
         var resourceName = $"FinDLNA.Templates.{templateName}.xml";
-
-        _logger.LogDebug("Attempting to load template: {ResourceName}", resourceName);
-
-        using var stream = assembly.GetManifestResourceStream(resourceName);
+        
+        using var stream = _assembly.GetManifestResourceStream(resourceName);
         if (stream == null)
         {
-            _logger.LogError("Template resource not found: {ResourceName}", resourceName);
-            
-            // MARK: Try alternative resource names
-            var allResources = assembly.GetManifestResourceNames();
-            var possibleMatches = allResources.Where(r => r.Contains(templateName)).ToList();
-            
-            if (possibleMatches.Any())
-            {
-                _logger.LogInformation("Possible template matches found:");
-                foreach (var match in possibleMatches)
-                {
-                    _logger.LogInformation("  - {Match}", match);
-                }
-            }
-            
+            LogTemplateNotFound(templateName, resourceName);
             throw new FileNotFoundException($"Template '{templateName}' not found as embedded resource");
         }
 
         using var reader = new StreamReader(stream);
         var content = reader.ReadToEnd();
         
-        _logger.LogInformation("Successfully loaded template {TemplateName}: {Length} characters", templateName, content.Length);
-        _logger.LogDebug("Template content preview: {Preview}", content.Substring(0, Math.Min(100, content.Length)));
-        
+        if (string.IsNullOrEmpty(content))
+        {
+            _logger.LogError("Template {TemplateName} is empty", templateName);
+            throw new InvalidDataException($"Template '{templateName}' is empty");
+        }
+
+        _logger.LogDebug("Loaded template {TemplateName}: {Length} characters", templateName, content.Length);
         return content;
+    }
+
+    // MARK: LogTemplateNotFound
+    private void LogTemplateNotFound(string templateName, string resourceName)
+    {
+        _logger.LogError("Template resource not found: {ResourceName}", resourceName);
+        
+        var allResources = _assembly.GetManifestResourceNames();
+        var possibleMatches = allResources.Where(r => r.Contains(templateName, StringComparison.OrdinalIgnoreCase)).ToList();
+        
+        if (possibleMatches.Count > 0)
+        {
+            _logger.LogInformation("Possible template matches found: {Matches}", string.Join(", ", possibleMatches));
+        }
+        else
+        {
+            _logger.LogWarning("No template matches found. Available resources: {Count}", allResources.Length);
+        }
     }
 
     // MARK: CreateErrorTemplate
     private string CreateErrorTemplate(string templateName)
     {
-        var errorXml = $"""
+        _logger.LogWarning("Returning error template for missing {TemplateName}", templateName);
+        
+        return $"""
             <?xml version="1.0"?>
             <error>
                 <message>Template '{templateName}' not found</message>
                 <timestamp>{DateTime.UtcNow:yyyy-MM-ddTHH:mm:ssZ}</timestamp>
             </error>
             """;
-            
-        _logger.LogWarning("Returning error template for missing {TemplateName}", templateName);
-        return errorXml;
     }
 
     // MARK: ClearCache
@@ -125,5 +105,23 @@ public class XmlTemplateService
     {
         _templates.Clear();
         _logger.LogInformation("Template cache cleared");
+    }
+
+    // MARK: IsTemplateAvailable
+    public bool IsTemplateAvailable(string templateName)
+    {
+        if (_templates.ContainsKey(templateName))
+            return true;
+
+        var resourceName = $"FinDLNA.Templates.{templateName}.xml";
+        return _assembly.GetManifestResourceStream(resourceName) != null;
+    }
+
+    // MARK: GetAvailableTemplates
+    public IEnumerable<string> GetAvailableTemplates()
+    {
+        return _assembly.GetManifestResourceNames()
+            .Where(name => name.StartsWith("FinDLNA.Templates.") && name.EndsWith(".xml"))
+            .Select(name => name.Substring("FinDLNA.Templates.".Length, name.Length - "FinDLNA.Templates.".Length - ".xml".Length));
     }
 }

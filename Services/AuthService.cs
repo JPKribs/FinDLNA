@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
 using System.Text;
@@ -37,84 +36,20 @@ public class AuthService
     {
         try
         {
-            var baseUrl = request.ServerUrl.TrimEnd('/');
-            var authUrl = $"{baseUrl}/Users/AuthenticateByName";
-
-            var authRequest = new
-            {
-                Username = request.Username,
-                Pw = request.Password ?? string.Empty
-            };
-
-            var json = JsonSerializer.Serialize(authRequest);
-            var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-            var requestMessage = new HttpRequestMessage(HttpMethod.Post, authUrl)
-            {
-                Content = content
-            };
-
-            requestMessage.Headers.Add("X-Emby-Authorization", 
-                $"MediaBrowser Client=\"{_clientOptions.AppName}\", Device=\"{_clientOptions.DeviceName}\", DeviceId=\"{_clientOptions.DeviceId}\", Version=\"{_clientOptions.AppVersion}\"");
-
-            var response = await _httpClient.SendAsync(requestMessage);
-
+            var response = await SendAuthRequestAsync(request);
+            
             if (!response.IsSuccessStatusCode)
             {
-                var errorContent = await response.Content.ReadAsStringAsync();
-                _logger.LogError("Authentication failed with status {StatusCode}: {Content}", 
-                    response.StatusCode, errorContent);
-
-                var errorMessage = response.StatusCode switch
-                {
-                    System.Net.HttpStatusCode.BadRequest => "Bad request — likely malformed credentials",
-                    System.Net.HttpStatusCode.Unauthorized => "Unauthorized — bad username/password",
-                    System.Net.HttpStatusCode.Forbidden => "Forbidden — account disabled or restricted",
-                    System.Net.HttpStatusCode.NotFound => "Not found — invalid server URL",
-                    _ => $"Unexpected error: {response.StatusCode}"
-                };
-
-                return new AuthResult { Success = false, Error = errorMessage };
+                return CreateErrorResult(response.StatusCode, await response.Content.ReadAsStringAsync());
             }
 
             var responseContent = await response.Content.ReadAsStringAsync();
-            
             if (string.IsNullOrEmpty(responseContent))
             {
                 return new AuthResult { Success = false, Error = "Empty response from server" };
             }
 
-            var responseObj = JsonSerializer.Deserialize<JsonElement>(responseContent);
-
-            string? accessToken = null;
-            string? userId = null;
-
-            if (responseObj.TryGetProperty("AccessToken", out var tokenElement))
-            {
-                accessToken = tokenElement.GetString();
-            }
-
-            if (responseObj.TryGetProperty("User", out var userElement))
-            {
-                if (userElement.TryGetProperty("Id", out var idElement))
-                {
-                    userId = idElement.GetString();
-                }
-            }
-
-            if (!string.IsNullOrEmpty(accessToken) && !string.IsNullOrEmpty(userId))
-            {
-                await SaveConfigurationAsync(baseUrl, accessToken, userId);
-
-                return new AuthResult
-                {
-                    Success = true,
-                    AccessToken = accessToken,
-                    UserId = userId
-                };
-            }
-
-            return new AuthResult { Success = false, Error = "Authentication response missing required fields" };
+            return await ProcessAuthResponseAsync(responseContent, request.ServerUrl);
         }
         catch (HttpRequestException httpEx)
         {
@@ -133,16 +68,115 @@ public class AuthService
         }
     }
 
+    // MARK: SendAuthRequestAsync
+    private async Task<HttpResponseMessage> SendAuthRequestAsync(LoginRequest request)
+    {
+        var baseUrl = request.ServerUrl.TrimEnd('/');
+        var authUrl = $"{baseUrl}/Users/AuthenticateByName";
+
+        var authRequest = new
+        {
+            Username = request.Username,
+            Pw = request.Password ?? string.Empty
+        };
+
+        var json = JsonSerializer.Serialize(authRequest);
+        var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+        var requestMessage = new HttpRequestMessage(HttpMethod.Post, authUrl) { Content = content };
+        requestMessage.Headers.Add("X-Emby-Authorization", BuildAuthHeader());
+
+        return await _httpClient.SendAsync(requestMessage);
+    }
+
+    // MARK: BuildAuthHeader
+    private string BuildAuthHeader()
+    {
+        return $"MediaBrowser Client=\"{_clientOptions.AppName}\", " +
+               $"Device=\"{_clientOptions.DeviceName}\", " +
+               $"DeviceId=\"{_clientOptions.DeviceId}\", " +
+               $"Version=\"{_clientOptions.AppVersion}\"";
+    }
+
+    // MARK: CreateErrorResult
+    private AuthResult CreateErrorResult(System.Net.HttpStatusCode statusCode, string errorContent)
+    {
+        _logger.LogError("Authentication failed with status {StatusCode}: {Content}", statusCode, errorContent);
+
+        var errorMessage = statusCode switch
+        {
+            System.Net.HttpStatusCode.BadRequest => "Bad request — likely malformed credentials",
+            System.Net.HttpStatusCode.Unauthorized => "Unauthorized — bad username/password",
+            System.Net.HttpStatusCode.Forbidden => "Forbidden — account disabled or restricted",
+            System.Net.HttpStatusCode.NotFound => "Not found — invalid server URL",
+            _ => $"Unexpected error: {statusCode}"
+        };
+
+        return new AuthResult { Success = false, Error = errorMessage };
+    }
+
+    // MARK: ProcessAuthResponseAsync
+    private async Task<AuthResult> ProcessAuthResponseAsync(string responseContent, string serverUrl)
+    {
+        var responseObj = JsonSerializer.Deserialize<JsonElement>(responseContent);
+
+        var accessToken = ExtractProperty(responseObj, "AccessToken");
+        var userId = ExtractNestedProperty(responseObj, "User", "Id");
+
+        if (string.IsNullOrEmpty(accessToken) || string.IsNullOrEmpty(userId))
+        {
+            return new AuthResult { Success = false, Error = "Authentication response missing required fields" };
+        }
+
+        await SaveConfigurationAsync(serverUrl.TrimEnd('/'), accessToken, userId);
+
+        return new AuthResult
+        {
+            Success = true,
+            AccessToken = accessToken,
+            UserId = userId
+        };
+    }
+
+    // MARK: ExtractProperty
+    private string? ExtractProperty(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var prop) ? prop.GetString() : null;
+    }
+
+    // MARK: ExtractNestedProperty
+    private string? ExtractNestedProperty(JsonElement element, string parentProperty, string childProperty)
+    {
+        if (element.TryGetProperty(parentProperty, out var parent) &&
+            parent.TryGetProperty(childProperty, out var child))
+        {
+            return child.GetString();
+        }
+        return null;
+    }
+
     // MARK: SaveConfigurationAsync
     private async Task SaveConfigurationAsync(string serverUrl, string accessToken, string userId)
     {
         var configPath = Path.Combine(Directory.GetCurrentDirectory(), "appsettings.json");
+        var existingConfig = await ReadExistingConfigAsync(configPath);
+        var updatedConfig = UpdateJellyfinSection(existingConfig, serverUrl, accessToken, userId);
+        
+        await File.WriteAllTextAsync(configPath, updatedConfig);
+        _logger.LogInformation("Configuration saved successfully");
+    }
 
+    // MARK: ReadExistingConfigAsync
+    private async Task<JsonElement> ReadExistingConfigAsync(string configPath)
+    {
         var json = await File.ReadAllTextAsync(configPath);
         using var document = JsonDocument.Parse(json);
-        var root = document.RootElement;
+        return document.RootElement.Clone();
+    }
 
-        var options = new JsonSerializerOptions { WriteIndented = true };
+    // MARK: UpdateJellyfinSection
+    private string UpdateJellyfinSection(JsonElement root, string serverUrl, string accessToken, string userId)
+    {
         using var stream = new MemoryStream();
         using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
 
@@ -152,12 +186,7 @@ public class AuthService
         {
             if (property.Name == "Jellyfin")
             {
-                writer.WritePropertyName("Jellyfin");
-                writer.WriteStartObject();
-                writer.WriteString("ServerUrl", serverUrl);
-                writer.WriteString("AccessToken", accessToken);
-                writer.WriteString("UserId", userId);
-                writer.WriteEndObject();
+                WriteJellyfinSection(writer, serverUrl, accessToken, userId);
             }
             else
             {
@@ -168,9 +197,17 @@ public class AuthService
         writer.WriteEndObject();
         writer.Flush();
 
-        var updatedJson = Encoding.UTF8.GetString(stream.ToArray());
-        await File.WriteAllTextAsync(configPath, updatedJson);
-        
-        _logger.LogInformation("Configuration saved successfully");
+        return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    // MARK: WriteJellyfinSection
+    private void WriteJellyfinSection(Utf8JsonWriter writer, string serverUrl, string accessToken, string userId)
+    {
+        writer.WritePropertyName("Jellyfin");
+        writer.WriteStartObject();
+        writer.WriteString("ServerUrl", serverUrl);
+        writer.WriteString("AccessToken", accessToken);
+        writer.WriteString("UserId", userId);
+        writer.WriteEndObject();
     }
 }

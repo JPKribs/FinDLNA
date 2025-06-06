@@ -11,33 +11,6 @@ public class DlnaDevice
     public int Port { get; set; } = 8200;
 }
 
-// MARK: DlnaContainer
-public class DlnaContainer
-{
-    public string Id { get; set; } = string.Empty;
-    public string ParentId { get; set; } = string.Empty;
-    public string Title { get; set; } = string.Empty;
-    public string Class { get; set; } = string.Empty;
-    public int ChildCount { get; set; }
-    public bool Restricted { get; set; } = true;
-    public bool Searchable { get; set; } = true;
-}
-
-// MARK: DlnaItem
-public class DlnaItem
-{
-    public string Id { get; set; } = string.Empty;
-    public string ParentId { get; set; } = string.Empty;
-    public string Title { get; set; } = string.Empty;
-    public string Class { get; set; } = string.Empty;
-    public string MimeType { get; set; } = string.Empty;
-    public string Url { get; set; } = string.Empty;
-    public long Size { get; set; }
-    public string Duration { get; set; } = string.Empty;
-    public string Resolution { get; set; } = string.Empty;
-    public bool Restricted { get; set; } = true;
-}
-
 // MARK: BrowseResult
 public class BrowseResult
 {

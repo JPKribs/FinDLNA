@@ -16,11 +16,3 @@ public class AuthResult
     public string UserId { get; set; } = string.Empty;
     public string Error { get; set; } = string.Empty;
 }
-
-// MARK: JellyfinConfig
-public class JellyfinConfig
-{
-    public string ServerUrl { get; set; } = string.Empty;
-    public string AccessToken { get; set; } = string.Empty;
-    public string UserId { get; set; } = string.Empty;
-}
