@@ -7,7 +7,7 @@ namespace FinDLNA.Services;
 // MARK: DlnaBackgroundService
 public class DlnaBackgroundService : BackgroundService
 {
-    private readonly DlnaService _dlnaService;
+    private readonly DLNAService _dlnaService;
     private readonly JellyfinService _jellyfinService;
     private readonly ILogger<DlnaBackgroundService> _logger;
     private readonly IConfiguration _configuration;
@@ -15,7 +15,7 @@ public class DlnaBackgroundService : BackgroundService
     private Timer? _cleanupTimer;
 
     public DlnaBackgroundService(
-        DlnaService dlnaService, 
+        DLNAService dlnaService, 
         JellyfinService jellyfinService,
         ILogger<DlnaBackgroundService> logger,
         IConfiguration configuration)
