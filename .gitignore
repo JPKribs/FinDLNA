@@ -1,6 +1,8 @@
 # Build output
 bin/
 obj/
+dist/
+publish/
 
 # Configuration files
 appsettings.json

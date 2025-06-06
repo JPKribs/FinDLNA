@@ -1,6 +1,8 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>FinDLNA Diagnostics</title>
     <style>
         * {
@@ -147,8 +149,9 @@
             border-top: 1px solid #444;
             display: none;
             white-space: pre-wrap;
-            font-family: monospace;
+            font-family: 'Courier New', Consolas, monospace;
             font-size: 0.9rem;
+            background: #2a2a2a;
         }
 
         .test-details.expanded {
@@ -206,6 +209,25 @@
 
         .back-link {
             margin-bottom: 20px;
+        }
+
+        .status-indicator {
+            margin-right: 8px;
+        }
+
+        .status-indicator.passed::before {
+            content: "✓";
+            color: #4CAF50;
+        }
+
+        .status-indicator.warning::before {
+            content: "⚠";
+            color: #FF9800;
+        }
+
+        .status-indicator.failed::before {
+            content: "✗";
+            color: #F44336;
         }
 
         @media (max-width: 768px) {
@@ -345,7 +367,7 @@
             document.getElementById('failedCount').textContent = data.failed;
 
             const testResults = document.getElementById('testResults');
-            testResults.innerHTML = `<pre style="background: #333; padding: 15px; border-radius: 6px; overflow-x: auto;">${data.summary}</pre>`;
+            testResults.innerHTML = `<pre style="background: #333; padding: 15px; border-radius: 6px; overflow-x: auto; font-family: 'Courier New', Consolas, monospace;">${escapeHtml(data.summary)}</pre>`;
 
             results.style.display = 'block';
         }
@@ -360,12 +382,12 @@
             testItem.innerHTML = `
                 <div class="test-header" onclick="toggleTestDetails(this)">
                     <div>
-                        <strong>${test.name}</strong>
-                        <div style="margin-top: 5px; font-size: 0.9rem; opacity: 0.8;">${test.message}</div>
+                        <strong><span class="status-indicator ${statusClass}"></span>${escapeHtml(test.name)}</strong>
+                        <div style="margin-top: 5px; font-size: 0.9rem; opacity: 0.8;">${escapeHtml(test.message)}</div>
                     </div>
-                    <span class="test-status ${statusClass}">${statusText}</span>
+                    <span class="test-status ${statusClass}">${escapeHtml(statusText)}</span>
                 </div>
-                <div class="test-details">${test.details || 'No additional details'}</div>
+                <div class="test-details">${escapeHtml(test.details || 'No additional details')}</div>
             `;
 
             return testItem;
@@ -380,9 +402,10 @@
             const recommendationsDiv = document.getElementById('recommendations');
             
             if (recommendations.length > 0) {
+                const escapedRecommendations = recommendations.map(rec => `<li>${escapeHtml(rec)}</li>`).join('');
                 recommendationsDiv.innerHTML = `
                     <h3>💡 Recommendations</h3>
-                    <ul>${recommendations.map(rec => `<li>${rec}</li>`).join('')}</ul>
+                    <ul>${escapedRecommendations}</ul>
                 `;
                 recommendationsDiv.style.display = 'block';
             } else {
@@ -403,7 +426,12 @@
             document.getElementById('recommendations').style.display = 'none';
         }
 
-        // Auto-run summary on page load
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
         document.addEventListener('DOMContentLoaded', () => {
             runDiagnostics(true);
         });

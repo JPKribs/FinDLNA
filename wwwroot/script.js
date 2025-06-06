@@ -79,6 +79,7 @@ document.addEventListener('DOMContentLoaded', function() {
             <div class="button-group">
                 <button id="refreshSsdpBtn" class="action-btn">Refresh SSDP</button>
                 <button id="restartDlnaBtn" class="action-btn">Restart DLNA</button>
+                <button id="diagnosticsBtn" class="action-btn">Diagnostics</button>
                 <button id="reconfigureBtn" class="reconfigure-btn">Reconfigure</button>
             </div>
         `;
@@ -89,6 +90,10 @@ document.addEventListener('DOMContentLoaded', function() {
         
         document.getElementById('restartDlnaBtn').addEventListener('click', async function() {
             await restartDlna();
+        });
+
+        document.getElementById('diagnosticsBtn').addEventListener('click', function() {
+            window.location.href = '/diagnostic.html';
         });
         
         document.getElementById('reconfigureBtn').addEventListener('click', function() {
